@@ -3,6 +3,7 @@ package opendrive
 import (
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"fmt"
@@ -62,6 +63,12 @@ type Object struct {
 	size    int64     // Size of the object
 }
 
+// parsePath parses an acd 'url'
+func parsePath(path string) (root string) {
+	root = strings.Trim(path, "/")
+	return
+}
+
 // ------------------------------------------------------------
 
 // Name of the remote (as passed into NewFs)
@@ -96,6 +103,8 @@ func (f *Fs) List(out fs.ListOpts, dir string) {
 
 // NewFs contstructs an Fs from the path, bucket:path
 func NewFs(name, root string) (fs.Fs, error) {
+	root = parsePath(root)
+	fs.Debugf(nil, "NewFS(\"%s\", \"%s\"", name, root)
 	username := fs.ConfigFileGet(name, "username")
 	if username == "" {
 		return nil, errors.New("username not found")
@@ -142,44 +151,33 @@ func NewFs(name, root string) (fs.Fs, error) {
 
 	fs.Debugf(nil, "Starting OpenDRIVE session with ID: %s", f.session.SessionID)
 
-	// f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
-	// // Set the test flag if required
-	// if *b2TestMode != "" {
-	// 	testMode := strings.TrimSpace(*b2TestMode)
-	// 	f.srv.SetHeader(testModeHeader, testMode)
-	// 	fs.Debugf(f, "Setting test header \"%s: %s\"", testModeHeader, testMode)
-	// }
-	// // Fill up the buffer tokens
-	// for i := 0; i < fs.Config.Transfers; i++ {
-	// 	f.bufferTokens <- nil
-	// }
-	// err = f.authorizeAccount()
-	// if err != nil {
-	// 	return nil, errors.Wrap(err, "failed to authorize account")
-	// }
-	// if f.root != "" {
-	// 	f.root += "/"
-	// 	// Check to see if the (bucket,directory) is actually an existing file
-	// 	oldRoot := f.root
-	// 	remote := path.Base(directory)
-	// 	f.root = path.Dir(directory)
-	// 	if f.root == "." {
-	// 		f.root = ""
-	// 	} else {
-	// 		f.root += "/"
-	// 	}
-	// 	_, err := f.NewObject(remote)
-	// 	if err != nil {
-	// 		if err == fs.ErrorObjectNotFound {
-	// 			// File doesn't exist so return old f
-	// 			f.root = oldRoot
-	// 			return f, nil
-	// 		}
-	// 		return nil, err
-	// 	}
-	// 	// return an error with an fs which points to the parent
-	// 	return f, fs.ErrorIsFile
-	// }
+	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
+
+	// Find the current root
+	err = f.dirCache.FindRoot(false)
+	if err != nil {
+		// Assume it is a file
+		newRoot, remote := dircache.SplitPath(root)
+		newF := *f
+		newF.dirCache = dircache.New(newRoot, "0", &newF)
+
+		// Make new Fs which is the parent
+		err = newF.dirCache.FindRoot(false)
+		if err != nil {
+			// No root so return old f
+			return f, nil
+		}
+		_, err := newF.newObjectWithInfo(remote, nil)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				// File doesn't exist so return old f
+				return f, nil
+			}
+			return nil, err
+		}
+		// return an error with an fs which points to the parent
+		return &newF, fs.ErrorIsFile
+	}
 	return f, nil
 }
 
@@ -207,43 +205,14 @@ func errorHandler(resp *http.Response) error {
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
 	fs.Debugf(nil, "Mkdir(\"%s\")", dir)
-	// // Can't create subdirs
-	// if dir != "" {
-	// 	return nil
-	// }
-	// opts := rest.Opts{
-	// 	Method: "POST",
-	// 	Path:   "/b2_create_bucket",
-	// }
-	// var request = api.CreateBucketRequest{
-	// 	AccountID: f.info.AccountID,
-	// 	Name:      f.bucket,
-	// 	Type:      "allPrivate",
-	// }
-	// var response api.Bucket
-	// err := f.pacer.Call(func() (bool, error) {
-	// 	resp, err := f.srv.CallJSON(&opts, &request, &response)
-	// 	return f.shouldRetry(resp, err)
-	// })
-	// if err != nil {
-	// 	if apiErr, ok := err.(*api.Error); ok {
-	// 		if apiErr.Code == "duplicate_bucket_name" {
-	// 			// Check this is our bucket - buckets are globally unique and this
-	// 			// might be someone elses.
-	// 			_, getBucketErr := f.getBucketID()
-	// 			if getBucketErr == nil {
-	// 				// found so it is our bucket
-	// 				return nil
-	// 			}
-	// 			if getBucketErr != fs.ErrorDirNotFound {
-	// 				fs.Debugf(f, "Error checking bucket exists: %v", getBucketErr)
-	// 			}
-	// 		}
-	// 	}
-	// 	return errors.Wrap(err, "failed to create bucket")
-	// }
-	// f.setBucketID(response.ID)
-	return nil
+	err := f.dirCache.FindRoot(true)
+	if err != nil {
+		return err
+	}
+	if dir != "" {
+		_, err = f.dirCache.FindDir(dir, true)
+	}
+	return err
 }
 
 // Rmdir deletes the bucket if the fs is at the root
@@ -289,20 +258,35 @@ func (f *Fs) Precision() time.Duration {
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) newObjectWithInfo(remote string, file *File) (fs.Object, error) {
 	fs.Debugf(nil, "newObjectWithInfo(%s, %v)", remote, file)
-	o := &Object{
-		fs:      f,
-		remote:  remote,
-		id:      file.FileID,
-		modTime: time.Unix(file.DateModified, 0),
-		size:    file.Size,
-	}
 
+	var o *Object
+	if nil != file {
+		o = &Object{
+			fs:      f,
+			remote:  remote,
+			id:      file.FileID,
+			modTime: time.Unix(file.DateModified, 0),
+			size:    file.Size,
+		}
+	} else {
+		o = &Object{
+			fs:     f,
+			remote: remote,
+		}
+
+		err := o.readMetaData()
+		if err != nil {
+			return nil, err
+		}
+	}
+	fs.Debugf(nil, "%v", o)
 	return o, nil
 }
 
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	fs.Debugf(nil, "NewObject(\"%s\"", remote)
 	return f.newObjectWithInfo(remote, nil)
 }
 
@@ -409,13 +393,6 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 			return folder.FolderID, true, nil
 		}
 	}
-	// for _, file := range folderList.Files {
-	// 	fs.Debugf(nil, "File: %s (%s)", file.Name, file.FileID)
-	// 	if leaf == file.Name {
-	// 		// found
-	// 		return file.FileID, true, nil
-	// 	}
-	// }
 
 	return "", false, nil
 }
@@ -521,7 +498,7 @@ func (o *Object) SetModTime(modTime time.Time) error {
 
 // Open an object for read
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	fs.Debugf(nil, "Open(\"%s\")", o.id)
+	fs.Debugf(nil, "Open(\"%v\")", o.remote)
 
 	// get the folderIDs
 	var resp *http.Response
@@ -579,4 +556,39 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	// return nil
 
 	return fmt.Errorf("Update not implemented")
+}
+
+func (o *Object) readMetaData() (err error) {
+	leaf, directoryID, err := o.fs.dirCache.FindRootAndPath(o.remote, false)
+	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return fs.ErrorObjectNotFound
+		}
+		return err
+	}
+	var resp *http.Response
+	folderList := FolderList{}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		opts := rest.Opts{
+			Method: "GET",
+			Path:   "/folder/itembyname.json/" + o.fs.session.SessionID + "/" + directoryID + "?name=" + leaf,
+		}
+		resp, err = o.fs.srv.CallJSON(&opts, nil, &folderList)
+		return o.fs.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to get folder list")
+	}
+
+	if len(folderList.Files) == 0 {
+		return fs.ErrorObjectNotFound
+	}
+
+	leafFile := folderList.Files[0]
+	o.id = leafFile.FileID
+	o.modTime = time.Unix(leafFile.DateModified, 0)
+	o.md5 = ""
+	o.size = leafFile.Size
+
+	return nil
 }
