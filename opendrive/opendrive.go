@@ -206,6 +206,7 @@ func errorHandler(resp *http.Response) error {
 
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
+	fs.Debugf(nil, "Mkdir(\"%s\")", dir)
 	// // Can't create subdirs
 	// if dir != "" {
 	// 	return nil
@@ -249,6 +250,7 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
+	fs.Debugf(nil, "Rmdir(\"%s\")", dir)
 	// if f.root != "" || dir != "" {
 	// 	return nil
 	// }
@@ -309,7 +311,8 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Debugf(nil, "Put()")
 	// Temporary Object under construction
 	// fs := &Object{
 	// 	fs:     f,
@@ -378,6 +381,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	fs.Debugf(nil, "FindLeaf(\"%s\", \"%s\")", pathID, leaf)
 
 	if pathID == "0" && leaf == "" {
+		fs.Debugf(nil, "Found OpenDRIVE root")
 		// that's the root directory
 		return pathID, true, nil
 	}
@@ -405,13 +409,13 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 			return folder.FolderID, true, nil
 		}
 	}
-	for _, file := range folderList.Files {
-		fs.Debugf(nil, "File: %s (%s)", file.Name, file.FileID)
-		if leaf == file.Name {
-			// found
-			return file.FileID, true, nil
-		}
-	}
+	// for _, file := range folderList.Files {
+	// 	fs.Debugf(nil, "File: %s (%s)", file.Name, file.FileID)
+	// 	if leaf == file.Name {
+	// 		// found
+	// 		return file.FileID, true, nil
+	// 	}
+	// }
 
 	return "", false, nil
 }
@@ -517,27 +521,28 @@ func (o *Object) SetModTime(modTime time.Time) error {
 
 // Open an object for read
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	// bigObject := o.Size() >= int64(tempLinkThreshold)
-	// if bigObject {
-	// 	fs.Debugf(o, "Downloading large object via tempLink")
-	// }
-	// file := acd.File{Node: o.info}
-	// var resp *http.Response
-	// headers := fs.OpenOptionHeaders(options)
-	// err = o.fs.pacer.Call(func() (bool, error) {
-	// 	if !bigObject {
-	// 		in, resp, err = file.OpenHeaders(headers)
-	// 	} else {
-	// 		in, resp, err = file.OpenTempURLHeaders(rest.ClientWithHeaderReset(o.fs.noAuthClient, headers), headers)
-	// 	}
-	// 	return o.fs.shouldRetry(resp, err)
-	// })
-	// return in, err
-	return nil, fmt.Errorf("Open not implemented")
+	fs.Debugf(nil, "Open(\"%s\")", o.id)
+
+	// get the folderIDs
+	var resp *http.Response
+	err = o.fs.pacer.Call(func() (bool, error) {
+		opts := rest.Opts{
+			Method: "GET",
+			Path:   "/download/file.json/" + o.id + "?session_id=" + o.fs.session.SessionID,
+		}
+		resp, err = o.fs.srv.Call(&opts)
+		return o.fs.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to open file)")
+	}
+
+	return resp.Body, nil
 }
 
 // Remove an object
 func (o *Object) Remove() error {
+	fs.Debugf(nil, "Remove(\"%s\")", o.id)
 	return fmt.Errorf("Remove not implemented")
 }
 
@@ -549,7 +554,8 @@ func (o *Object) Storable() bool {
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fs.Debugf(nil, "Update(\"%s\")", o.id)
 	// file := acd.File{Node: o.info}
 	// var info *acd.File
 	// var resp *http.Response
