@@ -73,3 +73,57 @@ type File struct {
 	Password          string `json:"Password"`
 	EditOnline        int    `json:"EditOnline"`
 }
+
+type createFile struct {
+	SessionID string `json:"session_id"`
+	FolderID  string `json:"folder_id"`
+	Name      string `json:"file_name"`
+}
+
+type createFileResponse struct {
+	FileID             string `json:"FileId"`
+	Name               string `json:"Name"`
+	GroupID            int    `json:"GroupID"`
+	Extension          string `json:"Extension"`
+	Size               string `json:"Size"`
+	Views              string `json:"Views"`
+	Downloads          string `json:"Downloads"`
+	DateModified       string `json:"DateModified"`
+	Access             string `json:"Access"`
+	Link               string `json:"Link"`
+	DownloadLink       string `json:"DownloadLink"`
+	StreamingLink      string `json:"StreamingLink"`
+	TempStreamingLink  string `json:"TempStreamingLink"`
+	DirUpdateTime      int    `json:"DirUpdateTime"`
+	TempLocation       string `json:"TempLocation"`
+	SpeedLimit         int    `json:"SpeedLimit"`
+	RequireCompression int    `json:"RequireCompression"`
+	RequireHash        int    `json:"RequireHash"`
+	RequireHashOnly    int    `json:"RequireHashOnly"`
+}
+
+type openUpload struct {
+	SessionID string `json:"session_id"`
+	FileID    string `json:"file_id"`
+	Size      int64  `json:"file_size"`
+}
+
+type openUploadResponse struct {
+	TempLocation       string `json:"TempLocation"`
+	RequireCompression bool   `json:"RequireCompression"`
+	RequireHash        bool   `json:"RequireHash"`
+	RequireHashOnly    bool   `json:"RequireHashOnly"`
+	SpeedLimit         int    `json:"SpeedLimit"`
+}
+
+type closeUpload struct {
+	SessionID    string `json:"session_id"`
+	FileID       string `json:"file_id"`
+	Size         int64  `json:"file_size"`
+	TempLocation string `json:"temp_location"`
+}
+
+type closeUploadResponse struct {
+	FileHash string `json:"FileHash"`
+	Size     int64  `json:"Size"`
+}
