@@ -1,8 +1,11 @@
 package opendrive
 
 import (
+	"bytes"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -290,20 +293,43 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(remote, nil)
 }
 
+// Creates from the parameters passed in a half finished Object which
+// must have setMetaData called on it
+//
+// Returns the object, leaf, directoryID and error
+//
+// Used to create new objects
+func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
+	// Create the directory for the object if it doesn't exist
+	leaf, directoryID, err = f.dirCache.FindRootAndPath(remote, true)
+	if err != nil {
+		return nil, leaf, directoryID, err
+	}
+	// Temporary Object under construction
+	o = &Object{
+		fs:     f,
+		remote: remote,
+	}
+	return o, leaf, directoryID, nil
+}
+
 // Put the object into the bucket
 //
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	fs.Debugf(nil, "Put()")
-	// Temporary Object under construction
-	// fs := &Object{
-	// 	fs:     f,
-	// 	remote: src.Remote(),
-	// }
-	// return fs, fs.Update(in, src)
-	return nil, nil
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime()
+
+	fs.Debugf(nil, "Put(%s)", remote)
+
+	o, _, _, err := f.createObject(remote, modTime, size)
+	if err != nil {
+		return nil, err
+	}
+	return o, o.Update(in, src, options...)
 }
 
 // retryErrorCodes is a slice of error codes that we will retry
@@ -532,7 +558,158 @@ func (o *Object) Storable() bool {
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	fs.Debugf(nil, "Update(\"%s\")", o.id)
+	size := src.Size()
+	modTime := src.ModTime()
+	fs.Debugf(nil, "%d %d", size, modTime)
+	fs.Debugf(nil, "Update(\"%s\", \"%s\")", o.id, o.remote)
+
+	var err error
+	if "" == o.id {
+		// We need to create a ID for this file
+		var resp *http.Response
+		response := createFileResponse{}
+		err = o.fs.pacer.Call(func() (bool, error) {
+			createFileData := createFile{SessionID: o.fs.session.SessionID, FolderID: "0", Name: o.remote}
+			opts := rest.Opts{
+				Method: "POST",
+				Path:   "/upload/create_file.json",
+			}
+			resp, err = o.fs.srv.CallJSON(&opts, &createFileData, &response)
+			return o.fs.shouldRetry(resp, err)
+		})
+		if err != nil {
+			return errors.Wrap(err, "failed to create file")
+		}
+
+		o.id = response.FileID
+	}
+	fmt.Println(o.id)
+
+	// Open file for upload
+	var resp *http.Response
+	openResponse := openUploadResponse{}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		openUploadData := openUpload{SessionID: o.fs.session.SessionID, FileID: o.id, Size: size}
+		fs.Debugf(nil, "PreOpen: %s", openUploadData)
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/upload/open_file_upload.json",
+		}
+		resp, err = o.fs.srv.CallJSON(&opts, &openUploadData, &openResponse)
+		return o.fs.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to create file")
+	}
+	fs.Debugf(nil, "PostOpen: %s", openResponse)
+
+	// 1 MB chunks size
+	chunkSize := int64(1024 * 1024 * 10)
+	chunkOffset := int64(0)
+	remainingBytes := size
+	chunkCounter := 0
+
+	for remainingBytes > 0 {
+		currentChunkSize := chunkSize
+		if currentChunkSize > remainingBytes {
+			currentChunkSize = remainingBytes
+		}
+		remainingBytes -= currentChunkSize
+		fs.Debugf(nil, "Chunk %d: size=%d, remain=%d", chunkCounter, currentChunkSize, remainingBytes)
+
+		err = o.fs.pacer.Call(func() (bool, error) {
+			var formBody bytes.Buffer
+			w := multipart.NewWriter(&formBody)
+			fw, err := w.CreateFormFile("file_data", o.remote)
+			if err != nil {
+				return false, err
+			}
+			if _, err = io.CopyN(fw, in, currentChunkSize); err != nil {
+				return false, err
+			}
+			// Add session_id
+			if fw, err = w.CreateFormField("session_id"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(o.fs.session.SessionID)); err != nil {
+				return false, err
+			}
+			// Add session_id
+			if fw, err = w.CreateFormField("session_id"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(o.fs.session.SessionID)); err != nil {
+				return false, err
+			}
+			// Add file_id
+			if fw, err = w.CreateFormField("file_id"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(o.id)); err != nil {
+				return false, err
+			}
+			// Add temp_location
+			if fw, err = w.CreateFormField("temp_location"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(openResponse.TempLocation)); err != nil {
+				return false, err
+			}
+			// Add chunk_offset
+			if fw, err = w.CreateFormField("chunk_offset"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(strconv.FormatInt(chunkOffset, 10))); err != nil {
+				return false, err
+			}
+			// Add chunk_size
+			if fw, err = w.CreateFormField("chunk_size"); err != nil {
+				return false, err
+			}
+			if _, err = fw.Write([]byte(strconv.FormatInt(currentChunkSize, 10))); err != nil {
+				return false, err
+			}
+			// Don't forget to close the multipart writer.
+			// If you don't close it, your request will be missing the terminating boundary.
+			w.Close()
+
+			opts := rest.Opts{
+				Method:       "POST",
+				Path:         "/upload/upload_file_chunk.json",
+				Body:         &formBody,
+				ExtraHeaders: map[string]string{"Content-Type": w.FormDataContentType()},
+			}
+			resp, err = o.fs.srv.Call(&opts)
+			return o.fs.shouldRetry(resp, err)
+		})
+		if err != nil {
+			return errors.Wrap(err, "failed to create file")
+		}
+
+		fmt.Println(resp.Body)
+		resp.Body.Close()
+
+		chunkCounter++
+		chunkOffset += currentChunkSize
+	}
+
+	// CLose file for upload
+	closeResponse := closeUploadResponse{}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		closeUploadData := closeUpload{SessionID: o.fs.session.SessionID, FileID: o.id, Size: size, TempLocation: openResponse.TempLocation}
+		fs.Debugf(nil, "PreClose: %s", closeUploadData)
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/upload/close_file_upload.json",
+		}
+		resp, err = o.fs.srv.CallJSON(&opts, &closeUploadData, &closeResponse)
+		return o.fs.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to create file")
+	}
+	fs.Debugf(nil, "PostClose: %s", closeResponse)
+
 	// file := acd.File{Node: o.info}
 	// var info *acd.File
 	// var resp *http.Response
@@ -555,7 +732,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	// o.info = info.Node
 	// return nil
 
-	return fmt.Errorf("Update not implemented")
+	return nil
 }
 
 func (o *Object) readMetaData() (err error) {
