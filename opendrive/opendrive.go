@@ -640,7 +640,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 		o.id = response.FileID
 	}
-	fmt.Println(o.id)
+	// fmt.Println(o.id)
 
 	// Open file for upload
 	var resp *http.Response
@@ -743,7 +743,6 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 			return errors.Wrap(err, "failed to create file")
 		}
 
-		fmt.Println(resp.Body)
 		resp.Body.Close()
 
 		chunkCounter++
@@ -765,8 +764,9 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if err != nil {
 		return errors.Wrap(err, "failed to create file")
 	}
-	fs.Debugf(nil, "PostClose: %s", closeResponse)
+	fs.Debugf(nil, "PostClose: %v", closeResponse)
 
+	o.size = closeResponse.Size
 	return nil
 }
 
