@@ -5,6 +5,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +32,7 @@ const (
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "opendrive",
-		Description: "OpenDRIVE",
+		Description: "OpenDrive",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name: "username",
@@ -47,6 +48,7 @@ func init() {
 // Fs represents a remote b2 server
 type Fs struct {
 	name     string             // name of this remote
+	root     string             // the path we are working on
 	features *fs.Features       // optional features
 	username string             // account name
 	password string             // auth key0
@@ -81,12 +83,12 @@ func (f *Fs) Name() string {
 
 // Root of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
-	return "/"
+	return f.root
 }
 
 // String converts this Fs to a string
 func (f *Fs) String() string {
-	return "OpenDRIVE"
+	return fmt.Sprintf("OpenDrive root '%s'", f.root)
 }
 
 // Features returns the optional features of this Fs
@@ -97,11 +99,6 @@ func (f *Fs) Features() *fs.Features {
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() fs.HashSet {
 	return fs.HashSet(fs.HashMD5)
-}
-
-// List walks the path returning iles and directories into out
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	f.dirCache.List(f, out, dir)
 }
 
 // NewFs contstructs an Fs from the path, bucket:path
@@ -120,13 +117,14 @@ func NewFs(name, root string) (fs.Fs, error) {
 		return nil, errors.New("password not found")
 	}
 
-	fs.Debugf(nil, "OpenDRIVE-user: %s", username)
-	fs.Debugf(nil, "OpenDRIVE-pass: %s", password)
+	fs.Debugf(nil, "OpenDrive-user: %s", username)
+	fs.Debugf(nil, "OpenDrive-pass: %s", password)
 
 	f := &Fs{
 		name:     name,
 		username: username,
 		password: password,
+		root:     root,
 		srv:      rest.NewClient(fs.Config.Client()).SetErrorHandler(errorHandler),
 		pacer:    pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
 	}
@@ -152,7 +150,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 		return nil, errors.Wrap(err, "failed to create session")
 	}
 
-	fs.Debugf(nil, "Starting OpenDRIVE session with ID: %s", f.session.SessionID)
+	fs.Debugf(nil, "Starting OpenDrive session with ID: %s", f.session.SessionID)
 
 	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
 
@@ -163,6 +161,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 		newRoot, remote := dircache.SplitPath(root)
 		newF := *f
 		newF.dirCache = dircache.New(newRoot, "0", &newF)
+		newF.root = newRoot
 
 		// Make new Fs which is the parent
 		err = newF.dirCache.FindRoot(false)
@@ -205,7 +204,7 @@ func errorHandler(resp *http.Response) error {
 	return nil
 }
 
-// Mkdir creates the bucket if it doesn't exist
+// Mkdir creates the folder if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
 	fs.Debugf(nil, "Mkdir(\"%s\")", dir)
 	err := f.dirCache.FindRoot(true)
@@ -218,42 +217,73 @@ func (f *Fs) Mkdir(dir string) error {
 	return err
 }
 
-// Rmdir deletes the bucket if the fs is at the root
+// deleteObject removes an object by ID
+func (f *Fs) deleteObject(id string) error {
+	return f.pacer.Call(func() (bool, error) {
+		removeDirData := removeFolder{SessionID: f.session.SessionID, FolderID: id}
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/folder/remove.json",
+		}
+		resp, err := f.srv.CallJSON(&opts, &removeDirData, nil)
+		return f.shouldRetry(resp, err)
+	})
+}
+
+// purgeCheck remotes the root directory, if check is set then it
+// refuses to do so if it has anything in
+func (f *Fs) purgeCheck(dir string, check bool) error {
+	root := path.Join(f.root, dir)
+	if root == "" {
+		return errors.New("can't purge root directory")
+	}
+	dc := f.dirCache
+	err := dc.FindRoot(false)
+	if err != nil {
+		return err
+	}
+	rootID, err := dc.FindDir(dir, false)
+	if err != nil {
+		return err
+	}
+	item, _, err := f.readMetaDataForFolderID(rootID)
+	if err != nil {
+		return err
+	}
+	if check && len(item.Files) != 0 {
+		return errors.New("folder not empty")
+	}
+	err = f.deleteObject(rootID)
+	if err != nil {
+		return err
+	}
+	f.dirCache.FlushDir(dir)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Rmdir deletes the root folder
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
-	fs.Debugf(nil, "Rmdir(\"%s\")", dir)
-	// if f.root != "" || dir != "" {
-	// 	return nil
-	// }
-	// opts := rest.Opts{
-	// 	Method: "POST",
-	// 	Path:   "/b2_delete_bucket",
-	// }
-	// bucketID, err := f.getBucketID()
-	// if err != nil {
-	// 	return err
-	// }
-	// var request = api.DeleteBucketRequest{
-	// 	ID:        bucketID,
-	// 	AccountID: f.info.AccountID,
-	// }
-	// var response api.Bucket
-	// err = f.pacer.Call(func() (bool, error) {
-	// 	resp, err := f.srv.CallJSON(&opts, &request, &response)
-	// 	return f.shouldRetry(resp, err)
-	// })
-	// if err != nil {
-	// 	return errors.Wrap(err, "failed to delete bucket")
-	// }
-	// f.clearBucketID()
-	// f.clearUploadURL()
-	return nil
+	fs.Debugf(nil, "Rmdir(\"%s\")", path.Join(f.root, dir))
+	return f.purgeCheck(dir, true)
 }
 
 // Precision of the remote
 func (f *Fs) Precision() time.Duration {
 	return time.Millisecond
+}
+
+// Purge deletes all the files and the container
+//
+// Optional interface: Only implement this if you have a way of
+// deleting all the files quicker than just running Remove() on the
+// result of List()
+func (f *Fs) Purge() error {
+	return f.purgeCheck("", false)
 }
 
 // Return an Object from a path
@@ -289,7 +319,7 @@ func (f *Fs) newObjectWithInfo(remote string, file *File) (fs.Object, error) {
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(remote string) (fs.Object, error) {
-	fs.Debugf(nil, "NewObject(\"%s\"", remote)
+	fs.Debugf(nil, "NewObject(\"%s\")", remote)
 	return f.newObjectWithInfo(remote, nil)
 }
 
@@ -311,6 +341,19 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 		remote: remote,
 	}
 	return o, leaf, directoryID, nil
+}
+
+// readMetaDataForPath reads the metadata from the path
+func (f *Fs) readMetaDataForFolderID(id string) (info *FolderList, resp *http.Response, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/folder/list.json/" + f.session.SessionID + "/" + id,
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(&opts, nil, &info)
+		return f.shouldRetry(resp, err)
+	})
+	return info, resp, err
 }
 
 // Put the object into the bucket
@@ -364,26 +407,28 @@ func (f *Fs) shouldRetry(resp *http.Response, err error) (bool, error) {
 	return fs.ShouldRetry(err) || fs.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-// DirCacher methos
+// DirCacher methods
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(pathID, leaf string) (newID string, err error) {
-	fs.Debugf(nil, "CreateDir(\"%s\", \"%s\")", pathID, leaf)
-	// //fmt.Printf("CreateDir(%q, %q)\n", pathID, leaf)
-	// folder := acd.FolderFromId(pathID, f.c.Nodes)
-	// var resp *http.Response
-	// var info *acd.Folder
-	// err = f.pacer.Call(func() (bool, error) {
-	// 	info, resp, err = folder.CreateFolder(leaf)
-	// 	return f.shouldRetry(resp, err)
-	// })
-	// if err != nil {
-	// 	//fmt.Printf("...Error %v\n", err)
-	// 	return "", err
-	// }
-	// //fmt.Printf("...Id %q\n", *info.Id)
-	// return *info.Id, nil
-	return "", fmt.Errorf("CreateDir not implemented")
+	fs.Debugf(f, "CreateDir(%q, %q)\n", pathID, leaf)
+	var resp *http.Response
+	response := createFolderResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		createDirData := createFolder{SessionID: f.session.SessionID, FolderName: leaf, FolderSubParent: pathID}
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/folder.json",
+		}
+		resp, err = f.srv.CallJSON(&opts, &createDirData, &response)
+		return f.shouldRetry(resp, err)
+	})
+	if err != nil {
+		// fmt.Printf("...Error %v\n", err)
+		return "", err
+	}
+	// fmt.Printf("...Id %q\n", response.FolderID)
+	return response.FolderID, nil
 }
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
@@ -391,7 +436,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	fs.Debugf(nil, "FindLeaf(\"%s\", \"%s\")", pathID, leaf)
 
 	if pathID == "0" && leaf == "" {
-		fs.Debugf(nil, "Found OpenDRIVE root")
+		fs.Debugf(nil, "Found OpenDrive root")
 		// that's the root directory
 		return pathID, true, nil
 	}
@@ -421,6 +466,11 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	}
 
 	return "", false, nil
+}
+
+// List walks the path returning files and directories into out
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	f.dirCache.List(f, out, dir)
 }
 
 // ListDir reads the directory specified by the job into out, returning any more jobs
@@ -546,7 +596,14 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 // Remove an object
 func (o *Object) Remove() error {
 	fs.Debugf(nil, "Remove(\"%s\")", o.id)
-	return fmt.Errorf("Remove not implemented")
+	return o.fs.pacer.Call(func() (bool, error) {
+		opts := rest.Opts{
+			Method: "DELETE",
+			Path:   "/file.json/" + o.fs.session.SessionID + "/" + o.id,
+		}
+		resp, err := o.fs.srv.Call(&opts)
+		return o.fs.shouldRetry(resp, err)
+	})
 }
 
 // Storable returns a boolean showing whether this object storable
@@ -709,28 +766,6 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return errors.Wrap(err, "failed to create file")
 	}
 	fs.Debugf(nil, "PostClose: %s", closeResponse)
-
-	// file := acd.File{Node: o.info}
-	// var info *acd.File
-	// var resp *http.Response
-	// var err error
-	// err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-	// 	start := time.Now()
-	// 	o.fs.tokenRenewer.Start()
-	// 	info, resp, err = file.Overwrite(in)
-	// 	o.fs.tokenRenewer.Stop()
-	// 	var ok bool
-	// 	ok, info, err = o.fs.checkUpload(resp, in, src, info, err, time.Since(start))
-	// 	if ok {
-	// 		return false, nil
-	// 	}
-	// 	return o.fs.shouldRetry(resp, err)
-	// })
-	// if err != nil {
-	// 	return err
-	// }
-	// o.info = info.Node
-	// return nil
 
 	return nil
 }
