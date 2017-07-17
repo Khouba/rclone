@@ -52,6 +52,29 @@ type Folder struct {
 	Encrypted     string `json:"Encrypted"`
 }
 
+type createFolder struct {
+	SessionID       string  `json:"session_id"`
+	FolderName      string `json:"folder_name"`
+	FolderSubParent string `json:"folder_sub_parent"`
+}
+
+type createFolderResponse struct {
+	FolderID      string `json:"FolderID"`
+	Name          string `json:"Name"`
+	DateCreated   int    `json:"DateCreated"`
+	DirUpdateTime int    `json:"DirUpdateTime"`
+	Access        int    `json:"Access"`
+	DateModified  int    `json:"DateModified"`
+	Shared        string `json:"Shared"`
+	Description   string `json:"Description"`
+	Link          string `json:"Link"`
+}
+
+type removeFolder struct {
+	SessionID string  `json:"session_id"`
+	FolderID  string `json:"folder_id"`
+}
+
 // File describes a OpenDRIVE file
 type File struct {
 	FileID            string `json:"FileId"`
