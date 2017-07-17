@@ -125,6 +125,12 @@ type createFileResponse struct {
 	RequireHashOnly    int    `json:"RequireHashOnly"`
 }
 
+type modTimeFile struct {
+	SessionID            string `json:"session_id"`
+	FileID               string `json:"file_id"`
+	FileModificationTime string `json:"file_modification_time"`
+}
+
 type openUpload struct {
 	SessionID string `json:"session_id"`
 	FileID    string `json:"file_id"`
