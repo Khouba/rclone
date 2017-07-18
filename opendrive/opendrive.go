@@ -5,6 +5,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -72,6 +73,14 @@ type Object struct {
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
+}
+
+// mimics url.PathEscape which only available from go 1.8
+func pathEscape(path string) string {
+	u := url.URL{
+		Path: path,
+	}
+	return u.EscapedPath()
 }
 
 // ------------------------------------------------------------
@@ -274,7 +283,7 @@ func (f *Fs) Rmdir(dir string) error {
 
 // Precision of the remote
 func (f *Fs) Precision() time.Duration {
-	return time.Millisecond
+	return time.Second
 }
 
 // Purge deletes all the files and the container
@@ -312,7 +321,6 @@ func (f *Fs) newObjectWithInfo(remote string, file *File) (fs.Object, error) {
 			return nil, err
 		}
 	}
-	fs.Debugf(nil, "%v", o)
 	return o, nil
 }
 
@@ -368,10 +376,35 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 
 	fs.Debugf(nil, "Put(%s)", remote)
 
-	o, _, _, err := f.createObject(remote, modTime, size)
+	o, leaf, directoryID, err := f.createObject(remote, modTime, size)
 	if err != nil {
 		return nil, err
 	}
+
+	if "" == o.id {
+		o.readMetaData()
+	}
+
+	if "" == o.id {
+		// We need to create a ID for this file
+		var resp *http.Response
+		response := createFileResponse{}
+		err := o.fs.pacer.Call(func() (bool, error) {
+			createFileData := createFile{SessionID: o.fs.session.SessionID, FolderID: directoryID, Name: replaceReservedChars(leaf)}
+			opts := rest.Opts{
+				Method: "POST",
+				Path:   "/upload/create_file.json",
+			}
+			resp, err = o.fs.srv.CallJSON(&opts, &createFileData, &response)
+			return o.fs.shouldRetry(resp, err)
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create file")
+		}
+
+		o.id = response.FileID
+	}
+
 	return o, o.Update(in, src, options...)
 }
 
@@ -390,20 +423,6 @@ var retryErrorCodes = []int{
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func (f *Fs) shouldRetry(resp *http.Response, err error) (bool, error) {
-	// if resp != nil {
-	// 	if resp.StatusCode == 401 {
-	// 		f.tokenRenewer.Invalidate()
-	// 		fs.Debugf(f, "401 error received - invalidating token")
-	// 		return true, err
-	// 	}
-	// 	// Work around receiving this error sporadically on authentication
-	// 	//
-	// 	// HTTP code 403: "403 Forbidden", reponse body: {"message":"Authorization header requires 'Credential' parameter. Authorization header requires 'Signature' parameter. Authorization header requires 'SignedHeaders' parameter. Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header. Authorization=Bearer"}
-	// 	if resp.StatusCode == 403 && strings.Contains(err.Error(), "Authorization header requires") {
-	// 		fs.Debugf(f, "403 \"Authorization header requires...\" error received - retry")
-	// 		return true, err
-	// 	}
-	// }
 	return fs.ShouldRetry(err) || fs.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -411,11 +430,11 @@ func (f *Fs) shouldRetry(resp *http.Response, err error) (bool, error) {
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(pathID, leaf string) (newID string, err error) {
-	fs.Debugf(f, "CreateDir(%q, %q)\n", pathID, leaf)
+	fs.Debugf(f, "CreateDir(%q, %q)\n", pathID, replaceReservedChars(leaf))
 	var resp *http.Response
 	response := createFolderResponse{}
 	err = f.pacer.Call(func() (bool, error) {
-		createDirData := createFolder{SessionID: f.session.SessionID, FolderName: leaf, FolderSubParent: pathID}
+		createDirData := createFolder{SessionID: f.session.SessionID, FolderName: replaceReservedChars(leaf), FolderSubParent: pathID}
 		opts := rest.Opts{
 			Method: "POST",
 			Path:   "/folder.json",
@@ -568,6 +587,7 @@ func (o *Object) ModTime() time.Time {
 
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(modTime time.Time) error {
+	fs.Debugf(nil, "SetModTime(%v)", modTime.String())
 	opts := rest.Opts{
 		Method: "PUT",
 		Path: "/file/filesettings.json",
@@ -625,48 +645,25 @@ func (o *Object) Storable() bool {
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	size := src.Size()
 	modTime := src.ModTime()
-	fs.Debugf(nil, "%d %d", size, modTime)
 	fs.Debugf(nil, "Update(\"%s\", \"%s\")", o.id, o.remote)
-
-	var err error
-	if "" == o.id {
-		// We need to create a ID for this file
-		var resp *http.Response
-		response := createFileResponse{}
-		err = o.fs.pacer.Call(func() (bool, error) {
-			createFileData := createFile{SessionID: o.fs.session.SessionID, FolderID: "0", Name: o.remote}
-			opts := rest.Opts{
-				Method: "POST",
-				Path:   "/upload/create_file.json",
-			}
-			resp, err = o.fs.srv.CallJSON(&opts, &createFileData, &response)
-			return o.fs.shouldRetry(resp, err)
-		})
-		if err != nil {
-			return errors.Wrap(err, "failed to create file")
-		}
-
-		o.id = response.FileID
-	}
-	// fmt.Println(o.id)
 
 	// Open file for upload
 	var resp *http.Response
 	openResponse := openUploadResponse{}
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
 		openUploadData := openUpload{SessionID: o.fs.session.SessionID, FileID: o.id, Size: size}
-		fs.Debugf(nil, "PreOpen: %s", openUploadData)
+		fs.Debugf(nil, "PreOpen: %#v", openUploadData)
 		opts := rest.Opts{
 			Method: "POST",
 			Path:   "/upload/open_file_upload.json",
 		}
-		resp, err = o.fs.srv.CallJSON(&opts, &openUploadData, &openResponse)
+		resp, err := o.fs.srv.CallJSON(&opts, &openUploadData, &openResponse)
 		return o.fs.shouldRetry(resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to create file")
 	}
-	fs.Debugf(nil, "PostOpen: %s", openResponse)
+	fs.Debugf(nil, "PostOpen: %#v", openResponse)
 
 	// 1 MB chunks size
 	chunkSize := int64(1024 * 1024 * 10)
@@ -757,7 +754,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		chunkOffset += currentChunkSize
 	}
 
-	// CLose file for upload
+	// Close file for upload
 	closeResponse := closeUploadResponse{}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		closeUploadData := closeUpload{SessionID: o.fs.session.SessionID, FileID: o.id, Size: size, TempLocation: openResponse.TempLocation}
@@ -772,16 +769,17 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if err != nil {
 		return errors.Wrap(err, "failed to create file")
 	}
-	fs.Debugf(nil, "PostClose: %v", closeResponse)
+	fs.Debugf(nil, "PostClose: %#v", closeResponse)
+
+	o.id = closeResponse.FileID
+	o.size = closeResponse.Size
+	o.modTime = modTime
 
 	// Set the mod time now and read metadata
 	err = o.SetModTime(modTime)
 	if err != nil {
 		return err
 	}
-
-	o.size = closeResponse.Size
-	o.modTime = modTime
 
 	return nil
 }
@@ -799,7 +797,7 @@ func (o *Object) readMetaData() (err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "GET",
-			Path:   "/folder/itembyname.json/" + o.fs.session.SessionID + "/" + directoryID + "?name=" + leaf,
+			Path:   "/folder/itembyname.json/" + o.fs.session.SessionID + "/" + directoryID + "?name=" + pathEscape(replaceReservedChars(leaf)),
 		}
 		resp, err = o.fs.srv.CallJSON(&opts, nil, &folderList)
 		return o.fs.shouldRetry(resp, err)

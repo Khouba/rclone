@@ -153,6 +153,7 @@ type closeUpload struct {
 }
 
 type closeUploadResponse struct {
+	FileID   string `json:"FileID"`
 	FileHash string `json:"FileHash"`
 	Size     int64  `json:"Size"`
 }
