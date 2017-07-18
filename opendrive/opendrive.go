@@ -192,6 +192,14 @@ func NewFs(name, root string) (fs.Fs, error) {
 	return f, nil
 }
 
+// rootSlash returns root with a slash on if it is empty, otherwise empty string
+func (f *Fs) rootSlash() string {
+	if f.root == "" {
+		return f.root
+	}
+	return f.root + "/"
+}
+
 // errorHandler parses a non 2xx error response into an error
 func errorHandler(resp *http.Response) error {
 	// Decode error response
@@ -284,6 +292,68 @@ func (f *Fs) Rmdir(dir string) error {
 // Precision of the remote
 func (f *Fs) Precision() time.Duration {
 	return time.Second
+}
+
+// Copy src to this remote using server side copy operations.
+//
+// This is stored with the remote path given
+//
+// It returns the destination Object and a possible error
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantCopy
+func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	fs.Debugf(nil, "Copy(%v)", remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't copy - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
+	err := srcObj.readMetaData()
+	if err != nil {
+		return nil, err
+	}
+
+	srcPath := srcObj.fs.rootSlash() + srcObj.remote
+	dstPath := f.rootSlash() + remote
+	if strings.ToLower(srcPath) == strings.ToLower(dstPath) {
+		return nil, errors.Errorf("Can't copy %q -> %q as are same name when lowercase", srcPath, dstPath)
+	}
+
+	// Create temporary object
+	dstObj, _, directoryID, err := f.createObject(remote, srcObj.modTime, srcObj.size)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy the object
+	var resp *http.Response
+	response := copyFileResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		copyFileData := copyFile{
+			SessionID:         f.session.SessionID,
+			SrcFileID:         srcObj.id,
+			DstFolderID:       directoryID,
+			Move:              "false",
+			OverwriteIfExists: "true",
+		}
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/file/move_copy.json",
+		}
+		resp, err = f.srv.CallJSON(&opts, &copyFileData, &response)
+		return f.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	size, _ := strconv.ParseInt(response.Size, 10, 64)
+	dstObj.id = response.FileID
+	dstObj.size = size
+
+	return dstObj, nil
 }
 
 // Purge deletes all the files and the container
@@ -511,6 +581,7 @@ func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.
 	}
 
 	for _, folder := range folderList.Folders {
+		folder.Name = restoreReservedChars(folder.Name)
 		fs.Debugf(nil, "Folder: %s (%s)", folder.Name, folder.FolderID)
 		remote := job.Path + folder.Name
 		if out.IncludeDirectory(remote) {
@@ -530,6 +601,7 @@ func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.
 	}
 
 	for _, file := range folderList.Files {
+		file.Name = restoreReservedChars(file.Name)
 		fs.Debugf(nil, "File: %s (%s)", file.Name, file.FileID)
 		remote := job.Path + file.Name
 		o, err := f.newObjectWithInfo(remote, &file)

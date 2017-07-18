@@ -97,6 +97,19 @@ type File struct {
 	EditOnline        int    `json:"EditOnline"`
 }
 
+type copyFile struct {
+	SessionID         string `json:"session_id"`
+	SrcFileID         string `json:"src_file_id"`
+	DstFolderID       string `json:"dst_folder_id"`
+	Move              string `json:"move"`
+	OverwriteIfExists string `json:"overwrite_if_exists"`
+}
+
+type copyFileResponse struct {
+	FileID string `json:"FileID"`
+	Size   string `json:"Size"`
+}
+
 type createFile struct {
 	SessionID string `json:"session_id"`
 	FolderID  string `json:"folder_id"`
