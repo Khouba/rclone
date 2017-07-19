@@ -356,6 +356,62 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	return dstObj, nil
 }
 
+// Move src to this remote using server side move operations.
+//
+// This is stored with the remote path given
+//
+// It returns the destination Object and a possible error
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
+	fs.Debugf(nil, "Move(%v)", remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
+	err := srcObj.readMetaData()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create temporary object
+	dstObj, _, directoryID, err := f.createObject(remote, srcObj.modTime, srcObj.size)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy the object
+	var resp *http.Response
+	response := copyFileResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		copyFileData := copyFile{
+			SessionID:         f.session.SessionID,
+			SrcFileID:         srcObj.id,
+			DstFolderID:       directoryID,
+			Move:              "true",
+			OverwriteIfExists: "true",
+		}
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/file/move_copy.json",
+		}
+		resp, err = f.srv.CallJSON(&opts, &copyFileData, &response)
+		return f.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	size, _ := strconv.ParseInt(response.Size, 10, 64)
+	dstObj.id = response.FileID
+	dstObj.size = size
+
+	return dstObj, nil
+}
+
 // Purge deletes all the files and the container
 //
 // Optional interface: Only implement this if you have a way of
@@ -564,7 +620,7 @@ func (f *Fs) List(out fs.ListOpts, dir string) {
 
 // ListDir reads the directory specified by the job into out, returning any more jobs
 func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
-	fs.Debugf(nil, "ListDir(%v, %v)", out, job)
+	fs.Debugf(nil, "ListDir(%v)", job.DirID)
 	// get the folderIDs
 	var resp *http.Response
 	folderList := FolderList{}
@@ -830,7 +886,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	closeResponse := closeUploadResponse{}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		closeUploadData := closeUpload{SessionID: o.fs.session.SessionID, FileID: o.id, Size: size, TempLocation: openResponse.TempLocation}
-		fs.Debugf(nil, "PreClose: %s", closeUploadData)
+		fs.Debugf(nil, "PreClose: %#v", closeUploadData)
 		opts := rest.Opts{
 			Method: "POST",
 			Path:   "/upload/close_file_upload.json",
