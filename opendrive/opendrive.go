@@ -724,8 +724,12 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	update := modTimeFile{SessionID: o.fs.session.SessionID, FileID: o.id, FileModificationTime: strconv.FormatInt(modTime.Unix(), 10)}
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(&opts, &update, nil)
+		fs.Debugf(nil, "...\n%#v", resp)
 		return o.fs.shouldRetry(resp, err)
 	})
+
+	o.modTime = modTime
+
 	return err
 }
 
@@ -911,7 +915,6 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 	o.id = closeResponse.FileID
 	o.size = closeResponse.Size
-	o.modTime = modTime
 
 	// Set the mod time now and read metadata
 	err = o.SetModTime(modTime)
