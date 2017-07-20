@@ -733,12 +733,21 @@ func (o *Object) SetModTime(modTime time.Time) error {
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	fs.Debugf(nil, "Open(\"%v\")", o.remote)
 
+	opts := fs.OpenOptionHeaders(options)
+	offset := "0"
+
+	if "" != opts["Range"] {
+		parts := strings.Split(opts["Range"], "=")
+		parts = strings.Split(parts[1], "-")
+		offset = parts[0]
+	}
+
 	// get the folderIDs
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "GET",
-			Path:   "/download/file.json/" + o.id + "?session_id=" + o.fs.session.SessionID,
+			Path:   "/download/file.json/" + o.id + "?session_id=" + o.fs.session.SessionID + "&offset=" + offset,
 		}
 		resp, err = o.fs.srv.Call(&opts)
 		return o.fs.shouldRetry(resp, err)
