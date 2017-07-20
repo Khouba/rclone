@@ -412,6 +412,89 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	return dstObj, nil
 }
 
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
+func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) (err error) {
+	fs.Debugf(nil, "DirMove(%v)", src.Root())
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(src, "DirMove error: not same remote type")
+		return fs.ErrorCantDirMove
+	}
+	srcPath := path.Join(srcFs.root, srcRemote)
+	dstPath := path.Join(f.root, dstRemote)
+
+	// Refuse to move to or from the root
+	if srcPath == "" || dstPath == "" {
+		fs.Debugf(src, "DirMove error: Can't move root")
+		return errors.New("can't move root directory")
+	}
+
+	// find the root src directory
+	err = srcFs.dirCache.FindRoot(false)
+	if err != nil {
+		return err
+	}
+
+	// Find ID of src parent
+	srcDirectoryID, err := srcFs.dirCache.FindDir(srcRemote, false)
+	if err != nil {
+		return err
+	}
+
+	// Find ID of dst parent, creating subdirs if necessary
+	findPath := dstRemote
+	if dstRemote == "" {
+		findPath = f.root
+	}
+	dstDirectoryID, err := f.dirCache.FindDir(findPath, true)
+	if err != nil {
+		return err
+	}
+
+	// Check destination does not exist
+	if dstRemote != "" {
+		_, err = f.dirCache.FindDir(dstRemote, false)
+		if err == fs.ErrorDirNotFound {
+			// OK
+		} else if err != nil {
+			return err
+		} else {
+			return fs.ErrorDirExists
+		}
+	}
+
+	var resp *http.Response
+	response := moveFolderResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		moveFolderData := moveFolder{
+			SessionID:   f.session.SessionID,
+			FolderID:    srcDirectoryID,
+			DstFolderID: dstDirectoryID,
+			Move:        "true",
+		}
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/folder/move_copy.json",
+		}
+		resp, err = f.srv.CallJSON(&opts, &moveFolderData, &response)
+		return f.shouldRetry(resp, err)
+	})
+	if err != nil {
+		fs.Debugf(src, "DirMove error %v", err)
+		return err
+	}
+
+	srcFs.dirCache.FlushDir(srcRemote)
+	return nil
+}
+
 // Purge deletes all the files and the container
 //
 // Optional interface: Only implement this if you have a way of

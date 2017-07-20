@@ -70,6 +70,17 @@ type createFolderResponse struct {
 	Link          string `json:"Link"`
 }
 
+type moveFolder struct {
+	SessionID   string `json:"session_id"`
+	FolderID    string `json:"folder_id"`
+	DstFolderID string `json:"dst_folder_id"`
+	Move        string `json:"move"`
+}
+
+type moveFolderResponse struct {
+	FolderID string `json:"FolderID"`
+}
+
 type removeFolder struct {
 	SessionID string  `json:"session_id"`
 	FolderID  string `json:"folder_id"`
