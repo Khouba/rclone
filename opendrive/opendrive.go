@@ -602,6 +602,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	}
 
 	for _, folder := range folderList.Folders {
+		folder.Name = restoreReservedChars(folder.Name)
 		fs.Debugf(nil, "Folder: %s (%s)", folder.Name, folder.FolderID)
 
 		if leaf == folder.Name {
