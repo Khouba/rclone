@@ -428,10 +428,9 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) (err error) {
 		return fs.ErrorCantDirMove
 	}
 	srcPath := path.Join(srcFs.root, srcRemote)
-	dstPath := path.Join(f.root, dstRemote)
 
 	// Refuse to move to or from the root
-	if srcPath == "" || dstPath == "" {
+	if srcPath == "" {
 		fs.Debugf(src, "DirMove error: Can't move root")
 		return errors.New("can't move root directory")
 	}
