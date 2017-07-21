@@ -642,7 +642,15 @@ func (f *Fs) CreateDir(pathID, leaf string) (newID string, err error) {
 	var resp *http.Response
 	response := createFolderResponse{}
 	err = f.pacer.Call(func() (bool, error) {
-		createDirData := createFolder{SessionID: f.session.SessionID, FolderName: replaceReservedChars(leaf), FolderSubParent: pathID}
+		createDirData := createFolder{
+			SessionID: f.session.SessionID,
+			FolderName: replaceReservedChars(leaf),
+			FolderSubParent: pathID,
+			FolderIsPublic: 0,
+			FolderPublicUpl: 0,
+			FolderPublicDisplay: 0,
+			FolderPublicDnl: 0,
+		}
 		opts := rest.Opts{
 			Method: "POST",
 			Path:   "/folder.json",
@@ -806,7 +814,6 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	update := modTimeFile{SessionID: o.fs.session.SessionID, FileID: o.id, FileModificationTime: strconv.FormatInt(modTime.Unix(), 10)}
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(&opts, &update, nil)
-		fs.Debugf(nil, "...\n%#v", resp)
 		return o.fs.shouldRetry(resp, err)
 	})
 
@@ -1000,6 +1007,21 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 	// Set the mod time now and read metadata
 	err = o.SetModTime(modTime)
+	if err != nil {
+		return err
+	}
+
+	// Set permissions
+	err = o.fs.pacer.Call(func() (bool, error) {
+		update := permissions{SessionID: o.fs.session.SessionID, FileID: o.id, FileIsPublic: 0}
+		fs.Debugf(nil, "Permissions : %#v", update)
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/file/access.json",
+		}
+		resp, err = o.fs.srv.CallJSON(&opts, &update, nil)
+		return o.fs.shouldRetry(resp, err)
+	})
 	if err != nil {
 		return err
 	}
