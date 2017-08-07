@@ -52,6 +52,7 @@ from various cloud storage systems and using file transfer services, such as:
   * Hubic
   * Backblaze B2
   * Yandex Disk
+  * OpenDrive
   * SFTP
   * FTP
   * The local filesystem

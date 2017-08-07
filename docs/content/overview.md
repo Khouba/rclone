@@ -27,6 +27,7 @@ Here is an overview of the major features of each cloud storage system.
 | Hubic                  | MD5     | Yes     | No               | No              | R/W       |
 | Backblaze B2           | SHA1    | Yes     | No               | No              | R/W       |
 | Yandex Disk            | MD5     | Yes     | No               | No              | R/W       |
+| OpenDrive              | -       | Yes     | Yes              | No              | -         |
 | SFTP                   | -       | Yes     | Depends          | No              | -         |
 | FTP                    | -       | No      | Yes              | No              | -         |
 | The local filesystem   | All     | Yes     | Depends          | No              | -         |
@@ -120,6 +121,7 @@ operations more efficient.
 | Hubic                  | Yes † | Yes  | No   | No      | No      |
 | Backblaze B2           | No    | No   | No   | No      | Yes     |
 | Yandex Disk            | Yes   | No   | No   | No      | No  [#575](https://github.com/ncw/rclone/issues/575) |
+| OpenDrive              | Yes   | No   | No   | No      | No      |
 | SFTP                   | No    | No   | Yes  | Yes     | No      |
 | FTP                    | No    | No   | Yes  | Yes     | No      |
 | The local filesystem   | Yes   | No   | Yes  | Yes     | No      |
