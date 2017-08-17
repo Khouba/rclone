@@ -22,10 +22,13 @@ Here is an example of how to make a remote called `remote`.  First run:
 This will guide you through an interactive setup process:
 
 ```
+No remotes found - make a new one
 n) New remote
-d) Delete remote
+r) Rename remote
+c) Copy remote
+s) Set configuration password
 q) Quit config
-e/n/d/q> n
+n/r/c/s/q> n
 name> remote
 Type of storage to configure.
 Choose a number from below, or type in your own value
@@ -39,27 +42,29 @@ Choose a number from below, or type in your own value
    \ "dropbox"
  5 / Encrypt/Decrypt a remote
    \ "crypt"
- 6 / Google Cloud Storage (this is not Google Drive)
+ 6 / FTP Connection
+   \ "ftp"
+ 7 / Google Cloud Storage (this is not Google Drive)
    \ "google cloud storage"
- 7 / Google Drive
+ 8 / Google Drive
    \ "drive"
- 8 / Hubic
+ 9 / Hubic
    \ "hubic"
- 9 / Local Disk
+10 / Local Disk
    \ "local"
-10 / Microsoft OneDrive
+11 / Microsoft OneDrive
    \ "onedrive"
-11 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
+12 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
    \ "swift"
-12 / SSH/SFTP Connection
+13 / SSH/SFTP Connection
    \ "sftp"
-13 / Yandex Disk
+14 / Yandex Disk
    \ "yandex"
-Storage> 7
+Storage> 8
 Google Application Client Id - leave blank normally.
-client_id>
+client_id> 
 Google Application Client Secret - leave blank normally.
-client_secret>
+client_secret> 
 Remote config
 Use auto config?
  * Say Y if not sure
@@ -71,10 +76,14 @@ If your browser doesn't open automatically go to the following link: http://127.
 Log in and authorize rclone for access
 Waiting for code...
 Got code
+Configure this as a team drive?
+y) Yes
+n) No
+y/n> n
 --------------------
 [remote]
-client_id =
-client_secret =
+client_id = 
+client_secret = 
 token = {"AccessToken":"xxxx.x.xxxxx_xxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","RefreshToken":"1/xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxx","Expiry":"2014-03-16T13:57:58.955387075Z","Extra":null}
 --------------------
 y) Yes this is OK
@@ -104,6 +113,44 @@ To copy a local directory to a drive directory called backup
 
     rclone copy /home/source remote:backup
 
+### Team drives ###
+
+If you want to configure the remote to point to a Google Team Drive
+then answer `y` to the question `Configure this as a team drive?`.
+
+This will fetch the list of Team Drives from google and allow you to
+configure which one you want to use.  You can also type in a team
+drive ID if you prefer.
+
+For example:
+
+```
+Configure this as a team drive?
+y) Yes
+n) No
+y/n> y
+Fetching team drive list...
+Choose a number from below, or type in your own value
+ 1 / Rclone Test
+   \ "xxxxxxxxxxxxxxxxxxxx"
+ 2 / Rclone Test 2
+   \ "yyyyyyyyyyyyyyyyyyyy"
+ 3 / Rclone Test 3
+   \ "zzzzzzzzzzzzzzzzzzzz"
+Enter a Team Drive ID> 1
+--------------------
+[remote]
+client_id = 
+client_secret = 
+token = {"AccessToken":"xxxx.x.xxxxx_xxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","RefreshToken":"1/xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxx","Expiry":"2014-03-16T13:57:58.955387075Z","Extra":null}
+team_drive = xxxxxxxxxxxxxxxxxxxx
+--------------------
+y) Yes this is OK
+e) Edit this remote
+d) Delete this remote
+y/e/d> y
+```
+
 ### Modified time ###
 
 Google drive stores modification times accurate to 1 ms.
@@ -131,6 +178,10 @@ sending them to the trash is required instead then use the
 Here are the command line options specific to this cloud storage
 system.
 
+#### --drive-auth-owner-only ####
+
+Only consider files owned by the authenticated user.
+
 #### --drive-chunk-size=SIZE ####
 
 Upload chunk size. Must a power of 2 >= 256k. Default value is 8 MB.
@@ -140,23 +191,9 @@ is buffered in memory one per transfer.
 
 Reducing this will reduce memory usage but decrease performance.
 
-#### --drive-full-list ####
-
-No longer does anything - kept for backwards compatibility.
-
-#### --drive-upload-cutoff=SIZE ####
-
-File size cutoff for switching to chunked upload.  Default is 8 MB.
-
-#### --drive-use-trash ####
-
-Send files to the trash instead of deleting permanently. Defaults to
-off, namely deleting files permanently.
-
 #### --drive-auth-owner-only ####
 
-Only consider files owned by the authenticated user. Requires
-that --drive-full-list=true (default).
+Only consider files owned by the authenticated user.
 
 #### --drive-formats ####
 
@@ -205,9 +242,31 @@ Here are the possible extensions with their corresponding mime types.
 | xlsx | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet | Microsoft Office Spreadsheet |
 | zip  | application/zip | A ZIP file of HTML, Images CSS |
 
+#### --drive-list-chunk int ####
+
+Size of listing chunk 100-1000. 0 to disable. (default 1000)
+
+#### --drive-shared-with-me ####
+
+Only show files that are shared with me
+
 #### --drive-skip-gdocs ####
 
 Skip google documents in all listings. If given, gdocs practically become invisible to rclone.
+
+#### --drive-trashed-only ####
+
+Only show files that are in the trash.  This will show trashed files
+in their original directory structure.
+
+#### --drive-upload-cutoff=SIZE ####
+
+File size cutoff for switching to chunked upload.  Default is 8 MB.
+
+#### --drive-use-trash ####
+
+Send files to the trash instead of deleting permanently. Defaults to
+off, namely deleting files permanently.
 
 ### Limitations ###
 
@@ -215,6 +274,45 @@ Drive has quite a lot of rate limiting.  This causes rclone to be
 limited to transferring about 2 files per second only.  Individual
 files may be transferred much faster at 100s of MBytes/s but lots of
 small files can take a long time.
+
+Server side copies are also subject to a separate rate limit. If you
+see User rate limit exceeded errors, wait at least 24 hours and retry.
+You can disable server side copies with `--disable copy` to download
+and upload the files if you prefer.
+
+### Duplicated files ###
+
+Sometimes, for no reason I've been able to track down, drive will
+duplicate a file that rclone uploads.  Drive unlike all the other
+remotes can have duplicated files.
+
+Duplicated files cause problems with the syncing and you will see
+messages in the log about duplicates.
+
+Use `rclone dedupe` to fix duplicated files.
+
+Note that this isn't just a problem with rclone, even Google Photos on
+Android duplicates files on drive sometimes.
+
+### Rclone appears to be re-copying files it shouldn't ###
+
+There are two possible reasons for rclone to recopy files which
+haven't changed to Google Drive.
+
+The first is the duplicated file issue above - run `rclone dedupe` and
+check your logs for duplicate object or directory messages.
+
+The second is that sometimes Google reports different sizes for the
+Google Docs exports which will cause rclone to re-download Google Docs
+for no apparent reason.  `--ignore-size` is a not very satisfactory
+work-around for this if it is causing you a lot of problems.
+
+### Google docs downloads sometimes fail with "Failed to copy: read X bytes expecting Y" ###
+
+This is the same problem as above.  Google reports the google doc is
+one size, but rclone downloads a different size.  Work-around with the
+`--ignore-size` flag or wait for rclone to retry the download which it
+will.
 
 ### Making your own client_id ###
 

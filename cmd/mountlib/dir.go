@@ -16,7 +16,7 @@ import (
 //
 // node may be nil, but o may not
 type DirEntry struct {
-	Obj  fs.BasicInfo
+	Obj  fs.DirEntry
 	Node Node
 }
 
@@ -27,17 +27,17 @@ type Dir struct {
 	f       fs.Fs
 	path    string
 	modTime time.Time
-	mu      sync.RWMutex // protects the following
-	read    time.Time    // time directory entry last read
-	items   map[string]*DirEntry
+	mu      sync.Mutex           // protects the following
+	read    time.Time            // time directory entry last read
+	items   map[string]*DirEntry // NB can be nil when directory not read yet
 }
 
-func newDir(fsys *FS, f fs.Fs, fsDir *fs.Dir) *Dir {
+func newDir(fsys *FS, f fs.Fs, fsDir fs.Directory) *Dir {
 	return &Dir{
 		fsys:    fsys,
 		f:       f,
-		path:    fsDir.Name,
-		modTime: fsDir.When,
+		path:    fsDir.Remote(),
+		modTime: fsDir.ModTime(),
 		inode:   NewInode(),
 	}
 }
@@ -113,23 +113,25 @@ func (d *Dir) walk(absPath string, fun func(*Dir)) {
 //
 // Reset the directory to new state, discarding all the objects and
 // reading everything again
-func (d *Dir) rename(newParent *Dir, fsDir *fs.Dir) {
+func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.ForgetAll()
-	d.path = fsDir.Name
-	d.modTime = fsDir.When
+	d.path = fsDir.Remote()
+	d.modTime = fsDir.ModTime()
 	d.read = time.Time{}
 }
 
 // addObject adds a new object or directory to the directory
 //
 // note that we add new objects rather than updating old ones
-func (d *Dir) addObject(o fs.BasicInfo, node Node) *DirEntry {
+func (d *Dir) addObject(o fs.DirEntry, node Node) *DirEntry {
 	item := &DirEntry{
 		Obj:  o,
 		Node: node,
 	}
 	d.mu.Lock()
-	d.items[path.Base(o.Remote())] = item
+	if d.items != nil {
+		d.items[path.Base(o.Remote())] = item
+	}
 	d.mu.Unlock()
 	return item
 }
@@ -137,16 +139,16 @@ func (d *Dir) addObject(o fs.BasicInfo, node Node) *DirEntry {
 // delObject removes an object from the directory
 func (d *Dir) delObject(leaf string) {
 	d.mu.Lock()
-	delete(d.items, leaf)
+	if d.items != nil {
+		delete(d.items, leaf)
+	}
 	d.mu.Unlock()
 }
 
-// read the directory
-func (d *Dir) readDir() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// read the directory and sets d.items - must be called with the lock held
+func (d *Dir) _readDir() error {
 	when := time.Now()
-	if d.read.IsZero() {
+	if d.read.IsZero() || d.items == nil {
 		// fs.Debugf(d.path, "Reading directory")
 	} else {
 		age := when.Sub(d.read)
@@ -180,14 +182,16 @@ func (d *Dir) readDir() error {
 				Obj:  obj,
 				Node: nil,
 			}
-		case *fs.Dir:
+		case fs.Directory:
 			dir := item
 			name := path.Base(dir.Remote())
 			// Use old dir value if it exists
-			if oldItem, ok := oldItems[name]; ok {
-				if _, ok := oldItem.Obj.(*fs.Dir); ok {
-					d.items[name] = oldItem
-					continue
+			if oldItems != nil {
+				if oldItem, ok := oldItems[name]; ok {
+					if _, ok := oldItem.Obj.(fs.Directory); ok {
+						d.items[name] = oldItem
+						continue
+					}
 				}
 			}
 			d.items[name] = &DirEntry{
@@ -208,13 +212,13 @@ func (d *Dir) readDir() error {
 //
 // returns ENOENT if not found.
 func (d *Dir) lookup(leaf string) (*DirEntry, error) {
-	err := d.readDir()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err := d._readDir()
 	if err != nil {
 		return nil, err
 	}
-	d.mu.RLock()
 	item, ok := d.items[leaf]
-	d.mu.RUnlock()
 	if !ok {
 		return nil, ENOENT
 	}
@@ -223,12 +227,12 @@ func (d *Dir) lookup(leaf string) (*DirEntry, error) {
 
 // Check to see if a directory is empty
 func (d *Dir) isEmpty() (bool, error) {
-	err := d.readDir()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err := d._readDir()
 	if err != nil {
 		return false, err
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
 	return len(d.items) == 0, nil
 }
 
@@ -262,7 +266,7 @@ func (d *Dir) lookupNode(leaf string) (item *DirEntry, err error) {
 	switch x := item.Obj.(type) {
 	case fs.Object:
 		node, err = newFile(d, x, leaf), nil
-	case *fs.Dir:
+	case fs.Directory:
 		node, err = newDir(d.fsys, d.f, x), nil
 	default:
 		err = errors.Errorf("unknown type %T", item)
@@ -297,13 +301,13 @@ func (d *Dir) Lookup(name string) (node Node, err error) {
 // ReadDirAll reads the contents of the directory
 func (d *Dir) ReadDirAll() (items []*DirEntry, err error) {
 	// fs.Debugf(d.path, "Dir.ReadDirAll")
-	err = d.readDir()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err = d._readDir()
 	if err != nil {
 		fs.Debugf(d.path, "Dir.ReadDirAll error: %v", err)
 		return nil, err
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
 	for _, item := range d.items {
 		items = append(items, item)
 	}
@@ -342,10 +346,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		fs.Errorf(path, "Dir.Mkdir failed to create directory: %v", err)
 		return nil, err
 	}
-	fsDir := &fs.Dir{
-		Name: path,
-		When: time.Now(),
-	}
+	fsDir := fs.NewDir(path, time.Now())
 	dir := newDir(d.fsys, d.f, fsDir)
 	d.addObject(fsDir, dir)
 	// fs.Debugf(path, "Dir.Mkdir OK")
@@ -373,7 +374,7 @@ func (d *Dir) Remove(name string) error {
 			fs.Errorf(path, "Dir.Remove file error: %v", err)
 			return err
 		}
-	case *fs.Dir:
+	case fs.Directory:
 		// Check directory is empty first
 		dir := item.Node.(*Dir)
 		empty, err := dir.isEmpty()
@@ -414,7 +415,7 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 		return err
 	}
-	var newObj fs.BasicInfo
+	var newObj fs.DirEntry
 	oldNode := oldItem.Node
 	switch x := oldItem.Obj.(type) {
 	case fs.Object:
@@ -440,23 +441,21 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 				oldFile.rename(destDir, newObject)
 			}
 		}
-	case *fs.Dir:
+	case fs.Directory:
 		doDirMove := d.f.Features().DirMove
 		if doDirMove == nil {
 			err := errors.Errorf("Fs %q can't rename directories (no DirMove)", d.f)
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
-		srcRemote := x.Name
+		srcRemote := x.Remote()
 		dstRemote := newPath
 		err = doDirMove(d.f, srcRemote, dstRemote)
 		if err != nil {
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
-		newDir := new(fs.Dir)
-		*newDir = *x
-		newDir.Name = newPath
+		newDir := fs.NewDirCopy(x).SetRemote(newPath)
 		newObj = newDir
 		// Update the node with the new details
 		if oldNode != nil {

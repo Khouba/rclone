@@ -12,18 +12,32 @@ import (
 	"time"
 
 	"github.com/VividCortex/ewma"
-	"github.com/tsenart/tb"
+	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.6
+	"golang.org/x/time/rate"
 )
 
 // Globals
 var (
 	Stats           = NewStats()
 	tokenBucketMu   sync.Mutex // protects the token bucket variables
-	tokenBucket     *tb.Bucket
+	tokenBucket     *rate.Limiter
 	prevTokenBucket = tokenBucket
 	currLimitMu     sync.Mutex // protects changes to the timeslot
 	currLimit       BwTimeSlot
 )
+
+const maxBurstSize = 1 * 1024 * 1024 // must be bigger than the biggest request
+
+// make a new empty token bucket with the bandwidth given
+func newTokenBucket(bandwidth SizeSuffix) *rate.Limiter {
+	tokenBucket = rate.NewLimiter(rate.Limit(bandwidth), maxBurstSize)
+	// empty the bucket
+	err := tokenBucket.WaitN(context.Background(), maxBurstSize)
+	if err != nil {
+		Errorf(nil, "Failed to empty token bucket: %v", err)
+	}
+	return tokenBucket
+}
 
 // Start the token bucket if necessary
 func startTokenBucket() {
@@ -32,7 +46,7 @@ func startTokenBucket() {
 	currLimitMu.Unlock()
 
 	if currLimit.bandwidth > 0 {
-		tokenBucket = tb.NewBucket(int64(currLimit.bandwidth), 100*time.Millisecond)
+		tokenBucket = newTokenBucket(currLimit.bandwidth)
 		Infof(nil, "Starting bandwidth limiter at %vBytes/s", &currLimit.bandwidth)
 
 		// Start the SIGUSR2 signal handler to toggle bandwidth.
@@ -57,16 +71,10 @@ func startTokenTicker() {
 
 			if currLimit.bandwidth != limitNow.bandwidth {
 				tokenBucketMu.Lock()
-				if tokenBucket != nil {
-					err := tokenBucket.Close()
-					if err != nil {
-						Debugf(nil, "Error closing token bucket: %v", err)
-					}
-				}
 
 				// Set new bandwidth. If unlimited, set tokenbucket to nil.
 				if limitNow.bandwidth > 0 {
-					tokenBucket = tb.NewBucket(int64(limitNow.bandwidth), 100*time.Millisecond)
+					tokenBucket = newTokenBucket(limitNow.bandwidth)
 					Logf(nil, "Scheduled bandwidth change. Limit set to %vBytes/s", &limitNow.bandwidth)
 				} else {
 					tokenBucket = nil
@@ -203,7 +211,7 @@ Elapsed time:  %10v
 
 // Log outputs the StatsInfo to the log
 func (s *StatsInfo) Log() {
-	Infof(nil, "%v\n", s)
+	LogLevelPrintf(Config.StatsLogLevel, nil, "%v\n", s)
 }
 
 // Bytes updates the stats for bytes bytes
@@ -350,7 +358,7 @@ func NewAccount(in io.ReadCloser, obj Object) *Account {
 func (acc *Account) WithBuffer() *Account {
 	acc.withBuf = true
 	var buffers int
-	if acc.size >= int64(Config.BufferSize) {
+	if acc.size >= int64(Config.BufferSize) || acc.size == -1 {
 		buffers = int(int64(Config.BufferSize) / asyncBufferSize)
 	} else {
 		buffers = int(acc.size / asyncBufferSize)
@@ -446,11 +454,13 @@ func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
 
 	// Get the token bucket in use
 	tokenBucketMu.Lock()
-	tb := tokenBucket
 
 	// Limit the transfer speed if required
-	if tb != nil {
-		tb.Wait(int64(n))
+	if tokenBucket != nil {
+		tbErr := tokenBucket.WaitN(context.Background(), n)
+		if tbErr != nil {
+			Errorf(nil, "Token bucket error: %v", err)
+		}
 	}
 	tokenBucketMu.Unlock()
 	return
@@ -474,11 +484,9 @@ func (acc *Account) Progress() (bytes, size int64) {
 		return 0, 0
 	}
 	acc.statmu.Lock()
-	if bytes > size {
-		size = 0
-	}
-	defer acc.statmu.Unlock()
-	return acc.bytes, acc.size
+	bytes, size = acc.bytes, acc.size
+	acc.statmu.Unlock()
+	return bytes, size
 }
 
 // Speed returns the speed of the current file transfer
@@ -528,7 +536,7 @@ func (acc *Account) ETA() (eta time.Duration, ok bool) {
 // String produces stats for this file
 func (acc *Account) String() string {
 	a, b := acc.Progress()
-	avg, cur := acc.Speed()
+	_, cur := acc.Speed()
 	eta, etaok := acc.ETA()
 	etas := "-"
 	if etaok {
@@ -545,7 +553,7 @@ func (acc *Account) String() string {
 	}
 
 	if Config.DataRateUnit == "bits" {
-		cur, avg = cur*8, avg*8
+		cur = cur * 8
 	}
 
 	done := ""

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ncw/rclone/cmd/mountlib"
 	"github.com/ncw/rclone/fs"
@@ -20,17 +21,6 @@ import (
 	"github.com/ncw/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
-
-// Globals
-var (
-	RemoteName      = flag.String("remote", "", "Remote to test with, defaults to local filesystem")
-	SubDir          = flag.Bool("subdir", false, "Set to test with a sub directory")
-	Verbose         = flag.Bool("verbose", false, "Set to enable logging")
-	DumpHeaders     = flag.Bool("dump-headers", false, "Set to dump headers (needs -verbose)")
-	DumpBodies      = flag.Bool("dump-bodies", false, "Set to dump bodies (needs -verbose)")
-	Individual      = flag.Bool("individual", false, "Make individual bucket/container/directory for each test - much slower")
-	LowLevelRetries = flag.Int("low-level-retries", 10, "Number of low level retries")
 )
 
 type (
@@ -45,12 +35,10 @@ var (
 )
 
 // TestMain drives the tests
-func TestMain(m *testing.M, fn MountFn, dirPerms, filePerms os.FileMode) {
+func TestMain(m *testing.M, fn MountFn) {
 	mountFn = fn
 	flag.Parse()
 	run = newRun()
-	run.dirPerms = dirPerms
-	run.filePerms = filePerms
 	rc := m.Run()
 	run.Finalise()
 	os.Exit(rc)
@@ -58,15 +46,14 @@ func TestMain(m *testing.M, fn MountFn, dirPerms, filePerms os.FileMode) {
 
 // Run holds the remotes for a test run
 type Run struct {
-	filesys             *mountlib.FS
-	mountPath           string
-	fremote             fs.Fs
-	fremoteName         string
-	cleanRemote         func()
-	umountResult        <-chan error
-	umountFn            UnmountFn
-	skip                bool
-	dirPerms, filePerms os.FileMode
+	filesys      *mountlib.FS
+	mountPath    string
+	fremote      fs.Fs
+	fremoteName  string
+	cleanRemote  func()
+	umountResult <-chan error
+	umountFn     UnmountFn
+	skip         bool
 }
 
 // run holds the master Run data
@@ -83,26 +70,17 @@ func newRun() *Run {
 		umountResult: make(chan error, 1),
 	}
 
-	// Never ask for passwords, fail instead.
-	// If your local config is encrypted set environment variable
-	// "RCLONE_CONFIG_PASS=hunter2" (or your password)
-	*fs.AskPassword = false
-	fs.LoadConfig()
-	if *Verbose {
-		fs.Config.LogLevel = fs.LogLevelDebug
-	}
-	fs.Config.DumpHeaders = *DumpHeaders
-	fs.Config.DumpBodies = *DumpBodies
-	fs.Config.LowLevelRetries = *LowLevelRetries
+	fstest.Initialise()
+
 	var err error
-	r.fremote, r.fremoteName, r.cleanRemote, err = fstest.RandomRemote(*RemoteName, *SubDir)
+	r.fremote, r.fremoteName, r.cleanRemote, err = fstest.RandomRemote(*fstest.RemoteName, *fstest.SubDir)
 	if err != nil {
-		log.Fatalf("Failed to open remote %q: %v", *RemoteName, err)
+		log.Fatalf("Failed to open remote %q: %v", *fstest.RemoteName, err)
 	}
 
 	err = r.fremote.Mkdir("")
 	if err != nil {
-		log.Fatalf("Failed to open mkdir %q: %v", *RemoteName, err)
+		log.Fatalf("Failed to open mkdir %q: %v", *fstest.RemoteName, err)
 	}
 
 	if runtime.GOOS != "windows" {
@@ -156,6 +134,11 @@ func (r *Run) umount() {
 	*/
 	log.Printf("Unmounting %q", r.mountPath)
 	err := r.umountFn()
+	if err != nil {
+		log.Printf("signal to umount failed - retrying: %v", err)
+		time.Sleep(3 * time.Second)
+		err = r.umountFn()
+	}
 	if err != nil {
 		log.Fatalf("signal to umount failed: %v", err)
 	}
@@ -224,17 +207,17 @@ func (r *Run) readLocal(t *testing.T, dir dirMap, filepath string) {
 		if fi.IsDir() {
 			dir[name+"/"] = struct{}{}
 			r.readLocal(t, dir, name)
-			assert.Equal(t, r.dirPerms, fi.Mode().Perm())
+			assert.Equal(t, mountlib.DirPerms, fi.Mode().Perm())
 		} else {
 			dir[fmt.Sprintf("%s %d", name, fi.Size())] = struct{}{}
-			assert.Equal(t, r.filePerms, fi.Mode().Perm())
+			assert.Equal(t, mountlib.FilePerms, fi.Mode().Perm())
 		}
 	}
 }
 
 // reads the remote tree into dir
 func (r *Run) readRemote(t *testing.T, dir dirMap, filepath string) {
-	objs, dirs, err := fs.NewLister().SetLevel(1).Start(r.fremote, filepath).GetAll()
+	objs, dirs, err := fs.WalkGetAll(r.fremote, filepath, true, 1)
 	if err == fs.ErrorDirNotFound {
 		return
 	}
@@ -309,5 +292,5 @@ func TestRoot(t *testing.T) {
 	fi, err := os.Lstat(run.mountPath)
 	require.NoError(t, err)
 	assert.True(t, fi.IsDir())
-	assert.Equal(t, fi.Mode().Perm(), run.dirPerms)
+	assert.Equal(t, fi.Mode().Perm(), mountlib.DirPerms)
 }

@@ -43,17 +43,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Globals
-var (
-	RemoteName      = flag.String("remote", "", "Remote to test with, defaults to local filesystem")
-	SubDir          = flag.Bool("subdir", false, "Set to test with a sub directory")
-	Verbose         = flag.Bool("verbose", false, "Set to enable logging")
-	DumpHeaders     = flag.Bool("dump-headers", false, "Set to dump headers (needs -verbose)")
-	DumpBodies      = flag.Bool("dump-bodies", false, "Set to dump bodies (needs -verbose)")
-	Individual      = flag.Bool("individual", false, "Make individual bucket/container/directory for each test - much slower")
-	LowLevelRetries = flag.Int("low-level-retries", 10, "Number of low level retries")
-)
-
 // Some times used in the tests
 var (
 	t1 = fstest.Time("2001-02-03T04:05:06.499999999Z")
@@ -64,11 +53,11 @@ var (
 // TestMain drives the tests
 func TestMain(m *testing.M) {
 	flag.Parse()
-	if !*Individual {
+	if !*fstest.Individual {
 		oneRun = newRun()
 	}
 	rc := m.Run()
-	if !*Individual {
+	if !*fstest.Individual {
 		oneRun.Finalise()
 	}
 	os.Exit(rc)
@@ -102,21 +91,12 @@ func newRun() *Run {
 		mkdir:  make(map[string]bool),
 	}
 
-	// Never ask for passwords, fail instead.
-	// If your local config is encrypted set environment variable
-	// "RCLONE_CONFIG_PASS=hunter2" (or your password)
-	*fs.AskPassword = false
-	fs.LoadConfig()
-	if *Verbose {
-		fs.Config.LogLevel = fs.LogLevelDebug
-	}
-	fs.Config.DumpHeaders = *DumpHeaders
-	fs.Config.DumpBodies = *DumpBodies
-	fs.Config.LowLevelRetries = *LowLevelRetries
+	fstest.Initialise()
+
 	var err error
-	r.fremote, r.fremoteName, r.cleanRemote, err = fstest.RandomRemote(*RemoteName, *SubDir)
+	r.fremote, r.fremoteName, r.cleanRemote, err = fstest.RandomRemote(*fstest.RemoteName, *fstest.SubDir)
 	if err != nil {
-		r.Fatalf("Failed to open remote %q: %v", *RemoteName, err)
+		r.Fatalf("Failed to open remote %q: %v", *fstest.RemoteName, err)
 	}
 
 	r.localName, err = ioutil.TempDir("", "rclone")
@@ -148,7 +128,7 @@ func (d dirsToRemove) Less(i, j int) bool { return len(d[i]) > len(d[j]) }
 // Finalise() will tidy them away when done.
 func NewRun(t *testing.T) *Run {
 	var r *Run
-	if *Individual {
+	if *fstest.Individual {
 		r = newRun()
 	} else {
 		// If not individual, use the global one with the clean method overridden
@@ -156,25 +136,26 @@ func NewRun(t *testing.T) *Run {
 		*r = *oneRun
 		r.cleanRemote = func() {
 			var toDelete dirsToRemove
-			list := fs.NewLister().Start(r.fremote, "")
-			for {
-				o, dir, err := list.Get()
+			require.NoError(t, fs.Walk(r.fremote, "", true, -1, func(dirPath string, entries fs.DirEntries, err error) error {
 				if err != nil {
 					if err == fs.ErrorDirNotFound {
-						break
+						return nil
 					}
 					t.Fatalf("Error listing: %v", err)
-				} else if o != nil {
-					err = o.Remove()
-					if err != nil {
-						t.Errorf("Error removing file %q: %v", o.Remote(), err)
-					}
-				} else if dir != nil {
-					toDelete = append(toDelete, dir.Remote())
-				} else {
-					break
 				}
-			}
+				for _, entry := range entries {
+					switch x := entry.(type) {
+					case fs.Object:
+						err = x.Remove()
+						if err != nil {
+							t.Errorf("Error removing file %q: %v", x.Remote(), err)
+						}
+					case fs.Directory:
+						toDelete = append(toDelete, x.Remote())
+					}
+				}
+				return nil
+			}))
 			sort.Sort(toDelete)
 			for _, dir := range toDelete {
 				err := r.fremote.Rmdir(dir)
@@ -405,7 +386,7 @@ func TestHashSums(t *testing.T) {
 		!strings.Contains(res, "                                  empty space\n") {
 		t.Errorf("empty space missing: %q", res)
 	}
-	if !strings.Contains(res, "6548b156ea68a4e003e786df99eee76  potato2\n") &&
+	if !strings.Contains(res, "d6548b156ea68a4e003e786df99eee76  potato2\n") &&
 		!strings.Contains(res, "                     UNSUPPORTED  potato2\n") &&
 		!strings.Contains(res, "                                  potato2\n") {
 		t.Errorf("potato2 missing: %q", res)
@@ -413,6 +394,7 @@ func TestHashSums(t *testing.T) {
 
 	// SHA1 Sum
 
+	buf.Reset()
 	err = fs.Sha1sum(r.fremote, &buf)
 	require.NoError(t, err)
 	res = buf.String()
@@ -429,17 +411,18 @@ func TestHashSums(t *testing.T) {
 
 	// Dropbox Hash Sum
 
+	buf.Reset()
 	err = fs.DropboxHashSum(r.fremote, &buf)
 	require.NoError(t, err)
 	res = buf.String()
 	if !strings.Contains(res, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty space\n") &&
-		!strings.Contains(res, "                                                                     UNSUPPORTED  empty space\n") &&
-		!strings.Contains(res, "                                                                                  empty space\n") {
+		!strings.Contains(res, "                                                     UNSUPPORTED  empty space\n") &&
+		!strings.Contains(res, "                                                                  empty space\n") {
 		t.Errorf("empty space missing: %q", res)
 	}
 	if !strings.Contains(res, "a979481df794fed9c3990a6a422e0b1044ac802c15fab13af9c687f8bdbee01a  potato2\n") &&
-		!strings.Contains(res, "                                                                     UNSUPPORTED  potato2\n") &&
-		!strings.Contains(res, "                                                                                  potato2\n") {
+		!strings.Contains(res, "                                                     UNSUPPORTED  potato2\n") &&
+		!strings.Contains(res, "                                                                  potato2\n") {
 		t.Errorf("potato2 missing: %q", res)
 	}
 }
@@ -664,25 +647,58 @@ func TestDeduplicateRename(t *testing.T) {
 	err := fs.Deduplicate(r.fremote, fs.DeduplicateRename)
 	require.NoError(t, err)
 
-	list := fs.NewLister().Start(r.fremote, "")
-	for {
-		o, err := list.GetObject()
-		require.NoError(t, err)
-		// Check if we are finished
-		if o == nil {
-			break
+	require.NoError(t, fs.Walk(r.fremote, "", true, -1, func(dirPath string, entries fs.DirEntries, err error) error {
+		if err != nil {
+			return err
 		}
-		remote := o.Remote()
-		if remote != "one-1.txt" &&
-			remote != "one-2.txt" &&
-			remote != "one-3.txt" {
-			t.Errorf("Bad file name after rename %q", remote)
-		}
-		size := o.Size()
-		if size != file1.Size && size != file2.Size && size != file3.Size {
-			t.Errorf("Size not one of the object sizes %d", size)
-		}
+		entries.ForObject(func(o fs.Object) {
+			remote := o.Remote()
+			if remote != "one-1.txt" &&
+				remote != "one-2.txt" &&
+				remote != "one-3.txt" {
+				t.Errorf("Bad file name after rename %q", remote)
+			}
+			size := o.Size()
+			if size != file1.Size && size != file2.Size && size != file3.Size {
+				t.Errorf("Size not one of the object sizes %d", size)
+			}
+		})
+		return nil
+	}))
+}
+
+// This should really be a unit test, but the test framework there
+// doesn't have enough tools to make it easy
+func TestMergeDirs(t *testing.T) {
+	r := NewRun(t)
+	defer r.Finalise()
+
+	mergeDirs := r.fremote.Features().MergeDirs
+	if mergeDirs == nil {
+		t.Skip("Can't merge directories")
 	}
+
+	file1 := r.WriteObject("dupe1/one.txt", "This is one", t1)
+	file2 := r.WriteObject("dupe2/two.txt", "This is one too", t2)
+	file3 := r.WriteObject("dupe3/three.txt", "This is another one", t3)
+
+	objs, dirs, err := fs.WalkGetAll(r.fremote, "", true, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 3, len(dirs))
+	assert.Equal(t, 0, len(objs))
+
+	err = mergeDirs(dirs)
+	require.NoError(t, err)
+
+	file2.Path = "dupe1/two.txt"
+	file3.Path = "dupe1/three.txt"
+	fstest.CheckItems(t, r.fremote, file1, file2, file3)
+
+	objs, dirs, err = fs.WalkGetAll(r.fremote, "", true, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(dirs))
+	assert.Equal(t, 0, len(objs))
+	assert.Equal(t, "dupe1", dirs[0].Remote())
 }
 
 func TestCat(t *testing.T) {
@@ -702,7 +718,7 @@ func TestCat(t *testing.T) {
 		{0, -1, "ABCDEFGHIJ", "012345678"},
 		{0, 5, "ABCDE", "01234"},
 		{-3, -1, "HIJ", "678"},
-		{2, 3, "CDE", "234"},
+		{1, 3, "BCD", "123"},
 	} {
 		var buf bytes.Buffer
 		err := fs.Cat(r.fremote, &buf, test.offset, test.count)
@@ -715,19 +731,31 @@ func TestCat(t *testing.T) {
 	}
 }
 
+func TestRcat(t *testing.T) {
+	r := NewRun(t)
+	defer r.Finalise()
+
+	fstest.CheckListing(t, r.fremote, []fstest.Item{})
+
+	data := "this is some really nice test data"
+	path := "file_from_pipe"
+
+	in := ioutil.NopCloser(strings.NewReader(data))
+	err := fs.Rcat(r.fremote, path, in, t1)
+	require.NoError(t, err)
+
+	file := fstest.NewItem(path, data, t1)
+	fstest.CheckItems(t, r.fremote, file)
+}
+
 func TestRmdirs(t *testing.T) {
 	r := NewRun(t)
 	defer r.Finalise()
 	r.Mkdir(r.fremote)
 
-	// Clean any directories that have crept in so far
-	// FIXME make the Finalise method do this?
-	require.NoError(t, fs.Rmdirs(r.fremote, ""))
-
 	// Make some files and dirs we expect to keep
 	r.ForceMkdir(r.fremote)
 	file1 := r.WriteObject("A1/B1/C1/one", "aaa", t1)
-	file2 := r.WriteObject("A1/two", "bbb", t2)
 	//..and dirs we expect to delete
 	require.NoError(t, fs.Mkdir(r.fremote, "A2"))
 	require.NoError(t, fs.Mkdir(r.fremote, "A1/B2"))
@@ -736,6 +764,8 @@ func TestRmdirs(t *testing.T) {
 	require.NoError(t, fs.Mkdir(r.fremote, "A3"))
 	require.NoError(t, fs.Mkdir(r.fremote, "A3/B3"))
 	require.NoError(t, fs.Mkdir(r.fremote, "A3/B3/C4"))
+	//..and one more file at the end
+	file2 := r.WriteObject("A1/two", "bbb", t2)
 
 	fstest.CheckListingWithPrecision(
 		t,
@@ -799,7 +829,7 @@ func TestMoveFile(t *testing.T) {
 	fstest.CheckItems(t, r.flocal)
 	fstest.CheckItems(t, r.fremote, file2)
 
-	err = fs.MoveFile(r.fremote, r.flocal, file2.Path, file2.Path)
+	err = fs.MoveFile(r.fremote, r.fremote, file2.Path, file2.Path)
 	require.NoError(t, err)
 	fstest.CheckItems(t, r.flocal)
 	fstest.CheckItems(t, r.fremote, file2)
@@ -825,7 +855,7 @@ func TestCopyFile(t *testing.T) {
 	fstest.CheckItems(t, r.flocal, file1)
 	fstest.CheckItems(t, r.fremote, file2)
 
-	err = fs.CopyFile(r.fremote, r.flocal, file2.Path, file2.Path)
+	err = fs.CopyFile(r.fremote, r.fremote, file2.Path, file2.Path)
 	require.NoError(t, err)
 	fstest.CheckItems(t, r.flocal, file1)
 	fstest.CheckItems(t, r.fremote, file2)
@@ -945,14 +975,14 @@ func TestListDirSorted(t *testing.T) {
 	var items fs.DirEntries
 	var err error
 
-	// Turn the BasicInfo into a name, ending with a / if it is a
+	// Turn the DirEntry into a name, ending with a / if it is a
 	// dir
 	str := func(i int) string {
 		item := items[i]
 		name := item.Remote()
 		switch item.(type) {
 		case fs.Object:
-		case *fs.Dir:
+		case fs.Directory:
 			name += "/"
 		default:
 			t.Fatalf("Unknown type %+v", item)

@@ -10,9 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -46,11 +44,12 @@ const (
 
 // Globals
 var (
-	minChunkSize       = fs.SizeSuffix(100E6)
+	minChunkSize       = fs.SizeSuffix(5E6)
 	chunkSize          = fs.SizeSuffix(96 * 1024 * 1024)
 	uploadCutoff       = fs.SizeSuffix(200E6)
 	b2TestMode         = fs.StringP("b2-test-mode", "", "", "A flag string for X-Bz-Test-Mode header.")
 	b2Versions         = fs.BoolP("b2-versions", "", false, "Include old versions in directory listings.")
+	b2HardDelete       = fs.BoolP("b2-hard-delete", "", false, "Permanently delete files on remote removal, otherwise hide files.")
 	errNotWithVersions = errors.New("can't modify or delete files in --b2-versions mode")
 )
 
@@ -86,6 +85,8 @@ type Fs struct {
 	endpoint      string                       // name of the starting api endpoint
 	srv           *rest.Client                 // the connection to the b2 server
 	bucket        string                       // the bucket we are working on
+	bucketOKMu    sync.Mutex                   // mutex to protect bucket OK
+	bucketOK      bool                         // true if we have created the bucket
 	bucketIDMutex sync.Mutex                   // mutex to protect _bucketID
 	_bucketID     string                       // the ID of the bucket we are working on
 	info          api.AuthorizeAccountResponse // result of authorize call
@@ -225,7 +226,7 @@ func errorHandler(resp *http.Response) error {
 // NewFs contstructs an Fs from the path, bucket:path
 func NewFs(name, root string) (fs.Fs, error) {
 	if uploadCutoff < chunkSize {
-		return nil, errors.Errorf("b2: upload cutoff must be less than chunk size %v - was %v", chunkSize, uploadCutoff)
+		return nil, errors.Errorf("b2: upload cutoff (%v) must be greater than or equal to chunk size (%v)", uploadCutoff, chunkSize)
 	}
 	if chunkSize < minChunkSize {
 		return nil, errors.Errorf("b2: chunk size can't be less than %v - was %v", minChunkSize, chunkSize)
@@ -254,7 +255,11 @@ func NewFs(name, root string) (fs.Fs, error) {
 		pacer:        pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
 		bufferTokens: make(chan []byte, fs.Config.Transfers),
 	}
-	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		ReadMimeType:  true,
+		WriteMimeType: true,
+		BucketBased:   true,
+	}).Fill(f)
 	// Set the test flag if required
 	if *b2TestMode != "" {
 		testMode := strings.TrimSpace(*b2TestMode)
@@ -301,9 +306,9 @@ func (f *Fs) authorizeAccount() error {
 	f.authMu.Lock()
 	defer f.authMu.Unlock()
 	opts := rest.Opts{
-		Absolute:     true,
 		Method:       "GET",
-		Path:         f.endpoint + "/b2api/v1/b2_authorize_account",
+		Path:         "/b2api/v1/b2_authorize_account",
+		RootURL:      f.endpoint,
 		UserName:     f.account,
 		Password:     f.key,
 		ExtraHeaders: map[string]string{"Authorization": ""}, // unset the Authorization for this request
@@ -436,18 +441,14 @@ var errEndList = errors.New("end list")
 // than 1000)
 //
 // If hidden is set then it will list the hidden (deleted) files too.
-func (f *Fs) list(dir string, level int, prefix string, limit int, hidden bool, fn listFn) error {
+func (f *Fs) list(dir string, recurse bool, prefix string, limit int, hidden bool, fn listFn) error {
 	root := f.root
 	if dir != "" {
 		root += dir + "/"
 	}
 	delimiter := ""
-	switch level {
-	case 1:
+	if !recurse {
 		delimiter = "/"
-	case fs.MaxLevel:
-	default:
-		return fs.ErrorLevelNotSupported
 	}
 	bucketID, err := f.getBucketID()
 	if err != nil {
@@ -495,7 +496,7 @@ func (f *Fs) list(dir string, level int, prefix string, limit int, hidden bool, 
 			}
 			remote := file.Name[len(f.root):]
 			// Check for directory
-			isDirectory := level != 0 && strings.HasSuffix(remote, "/")
+			isDirectory := strings.HasSuffix(remote, "/")
 			if isDirectory {
 				remote = remote[:len(remote)-1]
 			}
@@ -520,77 +521,112 @@ func (f *Fs) list(dir string, level int, prefix string, limit int, hidden bool, 
 	return nil
 }
 
-// listFiles walks the path returning files and directories to out
-func (f *Fs) listFiles(out fs.ListOpts, dir string) {
-	defer out.Finished()
-	// List the objects
+// Convert a list item into a DirEntry
+func (f *Fs) itemToDirEntry(remote string, object *api.File, isDirectory bool, last *string) (fs.DirEntry, error) {
+	if isDirectory {
+		d := fs.NewDir(remote, time.Time{})
+		return d, nil
+	}
+	if remote == *last {
+		remote = object.UploadTimestamp.AddVersion(remote)
+	} else {
+		*last = remote
+	}
+	// hide objects represent deleted files which we don't list
+	if object.Action == "hide" {
+		return nil, nil
+	}
+	o, err := f.newObjectWithInfo(remote, object)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// listDir lists a single directory
+func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
 	last := ""
-	err := f.list(dir, out.Level(), "", 0, *b2Versions, func(remote string, object *api.File, isDirectory bool) error {
-		if isDirectory {
-			dir := &fs.Dir{
-				Name:  remote,
-				Bytes: -1,
-				Count: -1,
-			}
-			if out.AddDir(dir) {
-				return fs.ErrorListAborted
-			}
-		} else {
-			if remote == last {
-				remote = object.UploadTimestamp.AddVersion(remote)
-			} else {
-				last = remote
-			}
-			// hide objects represent deleted files which we don't list
-			if object.Action == "hide" {
-				return nil
-			}
-			o, err := f.newObjectWithInfo(remote, object)
-			if err != nil {
-				return err
-			}
-			if out.Add(o) {
-				return fs.ErrorListAborted
-			}
+	err = f.list(dir, false, "", 0, *b2Versions, func(remote string, object *api.File, isDirectory bool) error {
+		entry, err := f.itemToDirEntry(remote, object, isDirectory, &last)
+		if err != nil {
+			return err
+		}
+		if entry != nil {
+			entries = append(entries, entry)
 		}
 		return nil
 	})
 	if err != nil {
-		out.SetError(err)
+		return nil, err
 	}
+	return entries, nil
 }
 
 // listBuckets returns all the buckets to out
-func (f *Fs) listBuckets(out fs.ListOpts, dir string) {
-	defer out.Finished()
+func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
 	if dir != "" {
-		out.SetError(fs.ErrorListOnlyRoot)
-		return
+		return nil, fs.ErrorListBucketRequired
 	}
-	err := f.listBucketsToFn(func(bucket *api.Bucket) error {
-		dir := &fs.Dir{
-			Name:  bucket.Name,
-			Bytes: -1,
-			Count: -1,
-		}
-		if out.AddDir(dir) {
-			return fs.ErrorListAborted
-		}
+	err = f.listBucketsToFn(func(bucket *api.Bucket) error {
+		d := fs.NewDir(bucket.Name, time.Time{})
+		entries = append(entries, d)
 		return nil
 	})
 	if err != nil {
-		out.SetError(err)
+		return nil, err
 	}
+	return entries, nil
 }
 
-// List walks the path returning files and directories to out
-func (f *Fs) List(out fs.ListOpts, dir string) {
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if f.bucket == "" {
-		f.listBuckets(out, dir)
-	} else {
-		f.listFiles(out, dir)
+		return f.listBuckets(dir)
 	}
-	return
+	return f.listDir(dir)
+}
+
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
+	if f.bucket == "" {
+		return fs.ErrorListBucketRequired
+	}
+	list := fs.NewListRHelper(callback)
+	last := ""
+	err = f.list(dir, true, "", 0, *b2Versions, func(remote string, object *api.File, isDirectory bool) error {
+		entry, err := f.itemToDirEntry(remote, object, isDirectory, &last)
+		if err != nil {
+			return err
+		}
+		return list.Add(entry)
+	})
+	if err != nil {
+		return err
+	}
+	return list.Flush()
 }
 
 // listBucketFn is called from listBucketsToFn to handle a bucket
@@ -666,13 +702,14 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 		fs:     f,
 		remote: src.Remote(),
 	}
-	return fs, fs.Update(in, src)
+	return fs, fs.Update(in, src, options...)
 }
 
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
-	// Can't create subdirs
-	if dir != "" {
+	f.bucketOKMu.Lock()
+	defer f.bucketOKMu.Unlock()
+	if f.bucketOK {
 		return nil
 	}
 	opts := rest.Opts{
@@ -697,6 +734,7 @@ func (f *Fs) Mkdir(dir string) error {
 				_, getBucketErr := f.getBucketID()
 				if getBucketErr == nil {
 					// found so it is our bucket
+					f.bucketOK = true
 					return nil
 				}
 				if getBucketErr != fs.ErrorDirNotFound {
@@ -707,6 +745,7 @@ func (f *Fs) Mkdir(dir string) error {
 		return errors.Wrap(err, "failed to create bucket")
 	}
 	f.setBucketID(response.ID)
+	f.bucketOK = true
 	return nil
 }
 
@@ -714,6 +753,8 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
+	f.bucketOKMu.Lock()
+	defer f.bucketOKMu.Unlock()
 	if f.root != "" || dir != "" {
 		return nil
 	}
@@ -737,6 +778,7 @@ func (f *Fs) Rmdir(dir string) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to delete bucket")
 	}
+	f.bucketOK = false
 	f.clearBucketID()
 	f.clearUploadURL()
 	return nil
@@ -745,6 +787,31 @@ func (f *Fs) Rmdir(dir string) error {
 // Precision of the remote
 func (f *Fs) Precision() time.Duration {
 	return time.Millisecond
+}
+
+// hide hides a file on the remote
+func (f *Fs) hide(Name string) error {
+	bucketID, err := f.getBucketID()
+	if err != nil {
+		return err
+	}
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/b2_hide_file",
+	}
+	var request = api.HideFileRequest{
+		BucketID: bucketID,
+		Name:     Name,
+	}
+	var response api.File
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(&opts, &request, &response)
+		return f.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to hide %q", Name)
+	}
+	return nil
 }
 
 // deleteByID deletes a file version given Name and ID
@@ -802,7 +869,7 @@ func (f *Fs) purge(oldOnly bool) error {
 		}()
 	}
 	last := ""
-	checkErr(f.list("", fs.MaxLevel, "", 0, true, func(remote string, object *api.File, isDirectory bool) error {
+	checkErr(f.list("", true, "", 0, true, func(remote string, object *api.File, isDirectory bool) error {
 		if !isDirectory {
 			fs.Stats.Checking(remote)
 			if oldOnly && last != remote {
@@ -947,7 +1014,7 @@ func (o *Object) readMetaData() (err error) {
 		maxSearched = maxVersions
 	}
 	var info *api.File
-	err = o.fs.list("", fs.MaxLevel, baseRemote, maxSearched, *b2Versions, func(remote string, object *api.File, isDirectory bool) error {
+	err = o.fs.list("", true, baseRemote, maxSearched, *b2Versions, func(remote string, object *api.File, isDirectory bool) error {
 		if isDirectory {
 			return nil
 		}
@@ -1079,10 +1146,9 @@ var _ io.ReadCloser = &openFile{}
 // Open an object for read
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	opts := rest.Opts{
-		Method:   "GET",
-		Absolute: true,
-		Path:     o.fs.info.DownloadURL,
-		Options:  options,
+		Method:  "GET",
+		RootURL: o.fs.info.DownloadURL,
+		Options: options,
 	}
 	// Download by id if set otherwise by name
 	if o.id != "" {
@@ -1165,6 +1231,10 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if *b2Versions {
 		return errNotWithVersions
 	}
+	err = o.fs.Mkdir("")
+	if err != nil {
+		return err
+	}
 	size := src.Size()
 
 	// If a large file upload in chunks - see upload.go
@@ -1177,42 +1247,13 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 
 	modTime := src.ModTime()
+
 	calculatedSha1, _ := src.Hash(fs.HashSHA1)
-
-	// If source cannot provide the hash, copy to a temporary file
-	// and calculate the hash while doing so.
-	// Then we serve the temporary file.
 	if calculatedSha1 == "" {
-		// Open a temp file to copy the input
-		fd, err := ioutil.TempFile("", "rclone-b2-")
-		if err != nil {
-			return err
-		}
-		_ = os.Remove(fd.Name()) // Delete the file - may not work on Windows
-		defer func() {
-			_ = fd.Close()           // Ignore error may have been closed already
-			_ = os.Remove(fd.Name()) // Delete the file - may have been deleted already
-		}()
-
-		// Copy the input while calculating the sha1
-		hash := sha1.New()
-		teed := io.TeeReader(in, hash)
-		n, err := io.Copy(fd, teed)
-		if err != nil {
-			return err
-		}
-		if n != size {
-			return errors.Errorf("read %d bytes expecting %d", n, size)
-		}
-		calculatedSha1 = fmt.Sprintf("%x", hash.Sum(nil))
-
-		// Rewind the temporary file
-		_, err = fd.Seek(0, 0)
-		if err != nil {
-			return err
-		}
-		// Set input to temporary file
-		in = fd
+		calculatedSha1 = "hex_digits_at_end"
+		har := newHashAppendingReader(in, sha1.New())
+		size += int64(har.AdditionalLength())
+		in = har
 	}
 
 	// Get upload URL
@@ -1279,10 +1320,9 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	// will be returned with the download.
 
 	opts := rest.Opts{
-		Method:   "POST",
-		Absolute: true,
-		Path:     upload.UploadURL,
-		Body:     in,
+		Method:  "POST",
+		RootURL: upload.UploadURL,
+		Body:    in,
 		ExtraHeaders: map[string]string{
 			"Authorization":  upload.AuthorizationToken,
 			"X-Bz-File-Name": urlEncode(o.fs.root + o.remote),
@@ -1320,27 +1360,10 @@ func (o *Object) Remove() error {
 	if *b2Versions {
 		return errNotWithVersions
 	}
-	bucketID, err := o.fs.getBucketID()
-	if err != nil {
-		return err
+	if *b2HardDelete {
+		return o.fs.deleteByID(o.id, o.remote)
 	}
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/b2_hide_file",
-	}
-	var request = api.HideFileRequest{
-		BucketID: bucketID,
-		Name:     o.fs.root + o.remote,
-	}
-	var response api.File
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(&opts, &request, &response)
-		return o.fs.shouldRetry(resp, err)
-	})
-	if err != nil {
-		return errors.Wrap(err, "failed to delete file")
-	}
-	return nil
+	return o.fs.hide(o.fs.root + o.remote)
 }
 
 // MimeType of an Object if known, "" otherwise
@@ -1353,6 +1376,7 @@ var (
 	_ fs.Fs         = &Fs{}
 	_ fs.Purger     = &Fs{}
 	_ fs.CleanUpper = &Fs{}
+	_ fs.ListRer    = &Fs{}
 	_ fs.Object     = &Object{}
 	_ fs.MimeTyper  = &Object{}
 )

@@ -21,6 +21,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -239,6 +240,9 @@ type Fs struct {
 	c                  *s3.S3           // the connection to the s3 server
 	ses                *session.Session // the s3 session
 	bucket             string           // the bucket we are working on
+	bucketOKMu         sync.Mutex       // mutex to protect bucket OK
+	bucketOK           bool             // true if we have created the bucket
+	bucketDeleted      bool             // true if we have deleted the bucket
 	acl                string           // ACL for new buckets / objects
 	locationConstraint string           // location constraint of new buckets
 	sse                string           // the type of server-side encryption
@@ -397,7 +401,11 @@ func NewFs(name, root string) (fs.Fs, error) {
 		sse:                fs.ConfigFileGet(name, "server_side_encryption"),
 		storageClass:       fs.ConfigFileGet(name, "storage_class"),
 	}
-	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		ReadMimeType:  true,
+		WriteMimeType: true,
+		BucketBased:   true,
+	}).Fill(f)
 	if *s3ACL != "" {
 		f.acl = *s3ACL
 	}
@@ -467,20 +475,16 @@ type listFn func(remote string, object *s3.Object, isDirectory bool) error
 //
 // dir is the starting directory, "" for root
 //
-// Level is the level of the recursion
-func (f *Fs) list(dir string, level int, fn listFn) error {
+// Set recurse to read sub directories
+func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 	root := f.root
 	if dir != "" {
 		root += dir + "/"
 	}
 	maxKeys := int64(listChunkSize)
 	delimiter := ""
-	switch level {
-	case 1:
+	if !recurse {
 		delimiter = "/"
-	case fs.MaxLevel:
-	default:
-		return fs.ErrorLevelNotSupported
 	}
 	var marker *string
 	for {
@@ -494,10 +498,15 @@ func (f *Fs) list(dir string, level int, fn listFn) error {
 		}
 		resp, err := f.c.ListObjects(&req)
 		if err != nil {
+			if awsErr, ok := err.(awserr.RequestFailure); ok {
+				if awsErr.StatusCode() == http.StatusNotFound {
+					err = fs.ErrorDirNotFound
+				}
+			}
 			return err
 		}
 		rootLength := len(f.root)
-		if level == 1 {
+		if !recurse {
 			for _, commonPrefix := range resp.CommonPrefixes {
 				if commonPrefix.Prefix == nil {
 					fs.Logf(f, "Nil common prefix received")
@@ -543,84 +552,107 @@ func (f *Fs) list(dir string, level int, fn listFn) error {
 	return nil
 }
 
-// listFiles lists files and directories to out
-func (f *Fs) listFiles(out fs.ListOpts, dir string) {
-	defer out.Finished()
-	if f.bucket == "" {
-		// Return no objects at top level list
-		out.SetError(errors.New("can't list objects at root - choose a bucket using lsd"))
-		return
+// Convert a list item into a DirEntry
+func (f *Fs) itemToDirEntry(remote string, object *s3.Object, isDirectory bool) (fs.DirEntry, error) {
+	if isDirectory {
+		size := int64(0)
+		if object.Size != nil {
+			size = *object.Size
+		}
+		d := fs.NewDir(remote, time.Time{}).SetSize(size)
+		return d, nil
 	}
+	o, err := f.newObjectWithInfo(remote, object)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// listDir lists files and directories to out
+func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
 	// List the objects and directories
-	err := f.list(dir, out.Level(), func(remote string, object *s3.Object, isDirectory bool) error {
-		if isDirectory {
-			size := int64(0)
-			if object.Size != nil {
-				size = *object.Size
-			}
-			dir := &fs.Dir{
-				Name:  remote,
-				Bytes: size,
-				Count: 0,
-			}
-			if out.AddDir(dir) {
-				return fs.ErrorListAborted
-			}
-		} else {
-			o, err := f.newObjectWithInfo(remote, object)
-			if err != nil {
-				return err
-			}
-			if out.Add(o) {
-				return fs.ErrorListAborted
-			}
+	err = f.list(dir, false, func(remote string, object *s3.Object, isDirectory bool) error {
+		entry, err := f.itemToDirEntry(remote, object, isDirectory)
+		if err != nil {
+			return err
+		}
+		if entry != nil {
+			entries = append(entries, entry)
 		}
 		return nil
 	})
 	if err != nil {
-		if awsErr, ok := err.(awserr.RequestFailure); ok {
-			if awsErr.StatusCode() == http.StatusNotFound {
-				err = fs.ErrorDirNotFound
-			}
-		}
-		out.SetError(err)
+		return nil, err
 	}
+	return entries, nil
 }
 
 // listBuckets lists the buckets to out
-func (f *Fs) listBuckets(out fs.ListOpts, dir string) {
-	defer out.Finished()
+func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
 	if dir != "" {
-		out.SetError(fs.ErrorListOnlyRoot)
-		return
+		return nil, fs.ErrorListBucketRequired
 	}
 	req := s3.ListBucketsInput{}
 	resp, err := f.c.ListBuckets(&req)
 	if err != nil {
-		out.SetError(err)
-		return
+		return nil, err
 	}
 	for _, bucket := range resp.Buckets {
-		dir := &fs.Dir{
-			Name:  aws.StringValue(bucket.Name),
-			When:  aws.TimeValue(bucket.CreationDate),
-			Bytes: -1,
-			Count: -1,
-		}
-		if out.AddDir(dir) {
-			break
-		}
+		d := fs.NewDir(aws.StringValue(bucket.Name), aws.TimeValue(bucket.CreationDate))
+		entries = append(entries, d)
 	}
+	return entries, nil
 }
 
-// List lists files and directories to out
-func (f *Fs) List(out fs.ListOpts, dir string) {
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if f.bucket == "" {
-		f.listBuckets(out, dir)
-	} else {
-		f.listFiles(out, dir)
+		return f.listBuckets(dir)
 	}
-	return
+	return f.listDir(dir)
+}
+
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
+	if f.bucket == "" {
+		return fs.ErrorListBucketRequired
+	}
+	list := fs.NewListRHelper(callback)
+	err = f.list(dir, true, func(remote string, object *s3.Object, isDirectory bool) error {
+		entry, err := f.itemToDirEntry(remote, object, isDirectory)
+		if err != nil {
+			return err
+		}
+		return list.Add(entry)
+	})
+	if err != nil {
+		return err
+	}
+	return list.Flush()
 }
 
 // Put the Object into the bucket
@@ -634,6 +666,8 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 }
 
 // Check if the bucket exists
+//
+// NB this can return incorrect results if called immediately after bucket deletion
 func (f *Fs) dirExists() (bool, error) {
 	req := s3.HeadBucketInput{
 		Bucket: &f.bucket,
@@ -652,13 +686,19 @@ func (f *Fs) dirExists() (bool, error) {
 
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
-	// Can't create subdirs
-	if dir != "" {
+	f.bucketOKMu.Lock()
+	defer f.bucketOKMu.Unlock()
+	if f.bucketOK {
 		return nil
 	}
-	exists, err := f.dirExists()
-	if err != nil || exists {
-		return err
+	if !f.bucketDeleted {
+		exists, err := f.dirExists()
+		if err == nil {
+			f.bucketOK = exists
+		}
+		if err != nil || exists {
+			return err
+		}
 	}
 	req := s3.CreateBucketInput{
 		Bucket: &f.bucket,
@@ -669,11 +709,15 @@ func (f *Fs) Mkdir(dir string) error {
 			LocationConstraint: &f.locationConstraint,
 		}
 	}
-	_, err = f.c.CreateBucket(&req)
+	_, err := f.c.CreateBucket(&req)
 	if err, ok := err.(awserr.Error); ok {
 		if err.Code() == "BucketAlreadyOwnedByYou" {
-			return nil
+			err = nil
 		}
+	}
+	if err == nil {
+		f.bucketOK = true
+		f.bucketDeleted = false
 	}
 	return err
 }
@@ -682,6 +726,8 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
+	f.bucketOKMu.Lock()
+	defer f.bucketOKMu.Unlock()
 	if f.root != "" || dir != "" {
 		return nil
 	}
@@ -689,6 +735,10 @@ func (f *Fs) Rmdir(dir string) error {
 		Bucket: &f.bucket,
 	}
 	_, err := f.c.DeleteBucket(&req)
+	if err == nil {
+		f.bucketOK = false
+		f.bucketDeleted = true
+	}
 	return err
 }
 
@@ -707,6 +757,10 @@ func (f *Fs) Precision() time.Duration {
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	err := f.Mkdir("")
+	if err != nil {
+		return nil, err
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't copy - not same remote type")
@@ -721,7 +775,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		CopySource:        &source,
 		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
 	}
-	_, err := f.c.CopyObject(&req)
+	_, err = f.c.CopyObject(&req)
 	if err != nil {
 		return nil, err
 	}
@@ -903,6 +957,10 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 
 // Update the Object from in with modTime and size
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	err := o.fs.Mkdir("")
+	if err != nil {
+		return err
+	}
 	modTime := src.ModTime()
 
 	uploader := s3manager.NewUploader(o.fs.ses, func(u *s3manager.Uploader) {
@@ -943,7 +1001,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if o.fs.storageClass != "" {
 		req.StorageClass = &o.fs.storageClass
 	}
-	_, err := uploader.Upload(&req)
+	_, err = uploader.Upload(&req)
 	if err != nil {
 		return err
 	}
@@ -979,6 +1037,7 @@ func (o *Object) MimeType() string {
 var (
 	_ fs.Fs        = &Fs{}
 	_ fs.Copier    = &Fs{}
+	_ fs.ListRer   = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.MimeTyper = &Object{}
 )

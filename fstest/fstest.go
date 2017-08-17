@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -24,17 +25,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Globals
 var (
-	// MatchTestRemote matches the remote names used for testing
-	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}$`)
+	RemoteName      = flag.String("remote", "", "Remote to test with, defaults to local filesystem")
+	SubDir          = flag.Bool("subdir", false, "Set to test with a sub directory")
+	Verbose         = flag.Bool("verbose", false, "Set to enable logging")
+	DumpHeaders     = flag.Bool("dump-headers", false, "Set to dump headers (needs -verbose)")
+	DumpBodies      = flag.Bool("dump-bodies", false, "Set to dump bodies (needs -verbose)")
+	Individual      = flag.Bool("individual", false, "Make individual bucket/container/directory for each test - much slower")
+	LowLevelRetries = flag.Int("low-level-retries", 10, "Number of low level retries")
+	UseListR        = flag.Bool("fast-list", false, "Use recursive list if available. Uses more memory but fewer transactions.")
 	// ListRetries is the number of times to retry a listing to overcome eventual consistency
 	ListRetries = flag.Int("list-retries", 6, "Number or times to retry listing")
+	// MatchTestRemote matches the remote names used for testing
+	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}$`)
 )
 
 // Seed the random number generator
 func init() {
 	rand.Seed(time.Now().UnixNano())
 
+}
+
+// Initialise rclone for testing
+func Initialise() {
+	// Never ask for passwords, fail instead.
+	// If your local config is encrypted set environment variable
+	// "RCLONE_CONFIG_PASS=hunter2" (or your password)
+	*fs.AskPassword = false
+	fs.LoadConfig()
+	if *Verbose {
+		fs.Config.LogLevel = fs.LogLevelDebug
+	}
+	fs.Config.DumpHeaders = *DumpHeaders
+	fs.Config.DumpBodies = *DumpBodies
+	fs.Config.LowLevelRetries = *LowLevelRetries
+	fs.Config.UseListR = *UseListR
 }
 
 // Item represents an item for checking
@@ -94,7 +120,7 @@ func (i *Item) CheckHashes(t *testing.T, obj fs.Object) {
 // Check checks all the attributes of the object are correct
 func (i *Item) Check(t *testing.T, obj fs.Object, precision time.Duration) {
 	i.CheckHashes(t, obj)
-	assert.Equal(t, i.Size, obj.Size(), fmt.Sprintf("%s: size incorrect", i.Path))
+	assert.Equal(t, i.Size, obj.Size(), fmt.Sprintf("%s: size incorrect file=%d vs obj=%d", i.Path, i.Size, obj.Size()))
 	i.CheckModTime(t, obj, obj.ModTime(), precision)
 }
 
@@ -174,6 +200,30 @@ func makeListingFromObjects(objs []fs.Object) string {
 	return strings.Join(nameLengths, ", ")
 }
 
+// filterEmptyDirs removes any empty (or containing only directories)
+// directories from expectedDirs
+func filterEmptyDirs(t *testing.T, items []Item, expectedDirs []string) (newExpectedDirs []string) {
+	dirs := map[string]struct{}{"": struct{}{}}
+	for _, item := range items {
+		base := item.Path
+		for {
+			base = path.Dir(base)
+			if base == "." || base == "/" {
+				break
+			}
+			dirs[base] = struct{}{}
+		}
+	}
+	for _, expectedDir := range expectedDirs {
+		if _, found := dirs[expectedDir]; found {
+			newExpectedDirs = append(newExpectedDirs, expectedDir)
+		} else {
+			t.Logf("Filtering empty directory %q", expectedDir)
+		}
+	}
+	return newExpectedDirs
+}
+
 // CheckListingWithPrecision checks the fs to see if it has the
 // expected contents with the given precision.
 //
@@ -181,10 +231,13 @@ func makeListingFromObjects(objs []fs.Object) string {
 // directories returned is also OK as some remotes don't return
 // directories.
 func CheckListingWithPrecision(t *testing.T, f fs.Fs, items []Item, expectedDirs []string, precision time.Duration) {
+	if expectedDirs != nil && !f.Features().CanHaveEmptyDirectories {
+		expectedDirs = filterEmptyDirs(t, items, expectedDirs)
+	}
 	is := NewItems(items)
 	oldErrors := fs.Stats.GetErrors()
 	var objs []fs.Object
-	var dirs []*fs.Dir
+	var dirs []fs.Directory
 	var err error
 	var retries = *ListRetries
 	sleep := time.Second / 2
@@ -192,13 +245,13 @@ func CheckListingWithPrecision(t *testing.T, f fs.Fs, items []Item, expectedDirs
 	gotListing := "<unset>"
 	listingOK := false
 	for i := 1; i <= retries; i++ {
-		objs, dirs, err = fs.NewLister().Start(f, "").GetAll()
+		objs, dirs, err = fs.WalkGetAll(f, "", true, -1)
 		if err != nil && err != fs.ErrorDirNotFound {
 			t.Fatalf("Error listing: %v", err)
 		}
 		gotListing = makeListingFromObjects(objs)
 		listingOK = wantListing1 == gotListing || wantListing2 == gotListing
-		if listingOK && (expectedDirs == nil || len(dirs) == 0 || len(dirs) == len(expectedDirs)) {
+		if listingOK && (expectedDirs == nil || len(dirs) == len(expectedDirs)) {
 			// Put an extra sleep in if we did any retries just to make sure it really
 			// is consistent (here is looking at you Amazon Drive!)
 			if i != 1 {
@@ -226,12 +279,11 @@ func CheckListingWithPrecision(t *testing.T, f fs.Fs, items []Item, expectedDirs
 	if len(items) == 0 && oldErrors == 0 && fs.Stats.GetErrors() == 1 {
 		fs.Stats.ResetErrors()
 	}
-	// Check the directories - ignore if no directories returned
-	// for remotes which can't do directories
-	if expectedDirs != nil && len(dirs) != 0 {
+	// Check the directories
+	if expectedDirs != nil {
 		actualDirs := []string{}
 		for _, dir := range dirs {
-			actualDirs = append(actualDirs, dir.Name)
+			actualDirs = append(actualDirs, dir.Remote())
 		}
 		sort.Strings(actualDirs)
 		sort.Strings(expectedDirs)

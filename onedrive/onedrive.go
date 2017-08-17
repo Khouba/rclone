@@ -205,20 +205,24 @@ func NewFs(name, root string) (fs.Fs, error) {
 		srv:   rest.NewClient(oAuthClient).SetRoot(rootURL),
 		pacer: pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
 	}
-	f.features = (&fs.Features{CaseInsensitive: true, ReadMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		CaseInsensitive:         true,
+		ReadMimeType:            true,
+		CanHaveEmptyDirectories: true,
+	}).Fill(f)
 	f.srv.SetErrorHandler(errorHandler)
-
-	// Get rootID
-	rootInfo, _, err := f.readMetaDataForPath("")
-	if err != nil || rootInfo.ID == "" {
-		return nil, errors.Wrap(err, "failed to get root")
-	}
 
 	// Renew the token in the background
 	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
 		_, _, err := f.readMetaDataForPath("")
 		return err
 	})
+
+	// Get rootID
+	rootInfo, _, err := f.readMetaDataForPath("")
+	if err != nil || rootInfo.ID == "" {
+		return nil, errors.Wrap(err, "failed to get root")
+	}
 
 	f.dirCache = dircache.New(root, rootInfo.ID, f)
 
@@ -393,54 +397,58 @@ OUTER:
 		if result.NextLink == "" {
 			break
 		}
-		opts.Path = result.NextLink
-		opts.Absolute = true
+		opts.Path = ""
+		opts.RootURL = result.NextLink
 	}
 	return
 }
 
-// ListDir reads the directory specified by the job into out, returning any more jobs
-func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
-	fs.Debugf(f, "Reading %q", job.Path)
-	_, err = f.listAll(job.DirID, false, false, func(info *api.Item) bool {
-		remote := job.Path + info.Name
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
+	err = f.dirCache.FindRoot(false)
+	if err != nil {
+		return nil, err
+	}
+	directoryID, err := f.dirCache.FindDir(dir, false)
+	if err != nil {
+		return nil, err
+	}
+	var iErr error
+	_, err = f.listAll(directoryID, false, false, func(info *api.Item) bool {
+		remote := path.Join(dir, info.Name)
 		if info.Folder != nil {
-			if out.IncludeDirectory(remote) {
-				dir := &fs.Dir{
-					Name:  remote,
-					Bytes: -1,
-					Count: -1,
-					When:  time.Time(info.LastModifiedDateTime),
-				}
-				if info.Folder != nil {
-					dir.Count = info.Folder.ChildCount
-				}
-				if out.AddDir(dir) {
-					return true
-				}
-				if job.Depth > 0 {
-					jobs = append(jobs, dircache.ListDirJob{DirID: info.ID, Path: remote + "/", Depth: job.Depth - 1})
-				}
+			// cache the directory ID for later lookups
+			f.dirCache.Put(remote, info.ID)
+			d := fs.NewDir(remote, time.Time(info.LastModifiedDateTime)).SetID(info.ID)
+			if info.Folder != nil {
+				d.SetItems(info.Folder.ChildCount)
 			}
+			entries = append(entries, d)
 		} else {
 			o, err := f.newObjectWithInfo(remote, info)
 			if err != nil {
-				out.SetError(err)
+				iErr = err
 				return true
 			}
-			if out.Add(o) {
-				return true
-			}
+			entries = append(entries, o)
 		}
 		return false
 	})
-	fs.Debugf(f, "Finished reading %q", job.Path)
-	return jobs, err
-}
-
-// List walks the path returning files and directories into out
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	f.dirCache.List(f, out, dir)
+	if err != nil {
+		return nil, err
+	}
+	if iErr != nil {
+		return nil, iErr
+	}
+	return entries, nil
 }
 
 // Creates from the parameters passed in a half finished Object which
@@ -560,8 +568,7 @@ func (f *Fs) waitForJob(location string, o *Object) error {
 	for time.Now().Before(deadline) {
 		opts := rest.Opts{
 			Method:       "GET",
-			Path:         location,
-			Absolute:     true,
+			RootURL:      location,
 			IgnoreStatus: true, // Ignore the http status response since it seems to return valid info on 500 errors
 		}
 		var resp *http.Response
@@ -925,13 +932,11 @@ func (o *Object) createUploadSession() (response *api.CreateUploadResponse, err 
 func (o *Object) uploadFragment(url string, start int64, totalSize int64, chunk io.ReadSeeker, chunkSize int64) (err error) {
 	opts := rest.Opts{
 		Method:        "PUT",
-		Path:          url,
-		Absolute:      true,
+		RootURL:       url,
 		ContentLength: &chunkSize,
 		ContentRange:  fmt.Sprintf("bytes %d-%d/%d", start, start+chunkSize-1, totalSize),
 		Body:          chunk,
 	}
-	fs.Debugf(o, "OPTS: %s", opts.ContentRange)
 	var response api.UploadFragmentResponse
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -946,8 +951,7 @@ func (o *Object) uploadFragment(url string, start int64, totalSize int64, chunk 
 func (o *Object) cancelUploadSession(url string) (err error) {
 	opts := rest.Opts{
 		Method:     "DELETE",
-		Path:       url,
-		Absolute:   true,
+		RootURL:    url,
 		NoResponse: true,
 	}
 	var resp *http.Response

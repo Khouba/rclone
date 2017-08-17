@@ -130,9 +130,14 @@ func NewFs(name, root string) (fs.Fs, error) {
 	yandexDisk := yandex.NewClient(token.AccessToken, fs.Config.Client())
 
 	f := &Fs{
-		yd: yandexDisk,
+		name: name,
+		yd:   yandexDisk,
 	}
-	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		ReadMimeType:            true,
+		WriteMimeType:           true,
+		CanHaveEmptyDirectories: true,
+	}).Fill(f)
 	f.setRoot(root)
 
 	// Check to see if the object exists and is a file
@@ -157,7 +162,7 @@ func (f *Fs) setRoot(root string) {
 	f.root = strings.Trim(root, "/")
 	//Set disk root path.
 	//Adding "disk:" to root path as all paths on disk start with it
-	var diskRoot = ""
+	var diskRoot string
 	if f.root == "" {
 		diskRoot = "disk:/"
 	} else {
@@ -166,11 +171,38 @@ func (f *Fs) setRoot(root string) {
 	f.diskRoot = diskRoot
 }
 
-// listFn is called from list and listContainerRoot to handle an object.
-type listFn func(remote string, item *yandex.ResourceInfoResponse, isDirectory bool) error
+// Convert a list item into a DirEntry
+func (f *Fs) itemToDirEntry(remote string, object *yandex.ResourceInfoResponse) (fs.DirEntry, error) {
+	switch object.ResourceType {
+	case "dir":
+		t, err := time.Parse(time.RFC3339Nano, object.Modified)
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing time in directory item")
+		}
+		d := fs.NewDir(remote, t).SetSize(int64(object.Size))
+		return d, nil
+	case "file":
+		o, err := f.newObjectWithInfo(remote, object)
+		if err != nil {
+			return nil, err
+		}
+		return o, nil
+	default:
+		fs.Debugf(f, "Unknown resource type %q", object.ResourceType)
+	}
+	return nil, nil
+}
 
-// listDir lists this directory only returning objects and directories
-func (f *Fs) listDir(dir string, fn listFn) (err error) {
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	//request object meta info
 	var opt yandex.ResourceInfoRequestOptions
 	root := f.diskRoot
@@ -187,28 +219,24 @@ func (f *Fs) listDir(dir string, fn listFn) (err error) {
 	for {
 		ResourceInfoResponse, err := f.yd.NewResourceInfoRequest(root, opt).Exec()
 		if err != nil {
-			return err
+			yErr, ok := err.(yandex.DiskClientError)
+			if ok && yErr.Code == "DiskNotFoundError" {
+				return nil, fs.ErrorDirNotFound
+			}
+			return nil, err
 		}
 		itemsCount = uint32(len(ResourceInfoResponse.Embedded.Items))
 
 		if ResourceInfoResponse.ResourceType == "dir" {
 			//list all subdirs
-			for i, element := range ResourceInfoResponse.Embedded.Items {
+			for _, element := range ResourceInfoResponse.Embedded.Items {
 				remote := path.Join(dir, element.Name)
-				fs.Debugf(i, "%q", remote)
-				switch element.ResourceType {
-				case "dir":
-					err = fn(remote, &element, true)
-					if err != nil {
-						return err
-					}
-				case "file":
-					err = fn(remote, &element, false)
-					if err != nil {
-						return err
-					}
-				default:
-					fs.Debugf(f, "Unknown resource type %q", element.ResourceType)
+				entry, err := f.itemToDirEntry(remote, &element)
+				if err != nil {
+					return nil, err
+				}
+				if entry != nil {
+					entries = append(entries, entry)
 				}
 			}
 		}
@@ -220,13 +248,26 @@ func (f *Fs) listDir(dir string, fn listFn) (err error) {
 			break
 		}
 	}
-	return nil
+	return entries, nil
 }
 
-// list the objects into the function supplied
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
 //
-// This does a flat listing of all the files in the drive
-func (f *Fs) list(dir string, fn listFn) error {
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 	//request files list. list is divided into pages. We send request for each page
 	//items per page is limited by limit
 	//TODO may be add config parameter for the items per page limit
@@ -246,21 +287,34 @@ func (f *Fs) list(dir string, fn listFn) error {
 		//send request
 		info, err := f.yd.NewFlatFileListRequest(opt).Exec()
 		if err != nil {
+			yErr, ok := err.(yandex.DiskClientError)
+			if ok && yErr.Code == "DiskNotFoundError" {
+				return fs.ErrorDirNotFound
+			}
 			return err
 		}
 		itemsCount = uint32(len(info.Items))
 
 		//list files
+		entries := make(fs.DirEntries, 0, len(info.Items))
 		for _, item := range info.Items {
 			// filter file list and get only files we need
 			if strings.HasPrefix(item.Path, prefix) {
 				//trim root folder from filename
 				var name = strings.TrimPrefix(item.Path, f.diskRoot)
-				err = fn(name, &item, false)
+				entry, err := f.itemToDirEntry(name, &item)
 				if err != nil {
 					return err
 				}
+				if entry != nil {
+					entries = append(entries, entry)
+				}
 			}
+		}
+		// send the listing
+		err = callback(entries)
+		if err != nil {
+			return err
 		}
 
 		//offset for the next page of items
@@ -271,51 +325,6 @@ func (f *Fs) list(dir string, fn listFn) error {
 		}
 	}
 	return nil
-}
-
-// List walks the path returning a channel of Objects
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	defer out.Finished()
-
-	listItem := func(remote string, object *yandex.ResourceInfoResponse, isDirectory bool) error {
-		if isDirectory {
-			t, err := time.Parse(time.RFC3339Nano, object.Modified)
-			if err != nil {
-				return err
-			}
-			dir := &fs.Dir{
-				Name:  remote,
-				When:  t,
-				Bytes: int64(object.Size),
-				Count: -1,
-			}
-			if out.AddDir(dir) {
-				return fs.ErrorListAborted
-			}
-		} else {
-			o, err := f.newObjectWithInfo(remote, object)
-			if err != nil {
-				return err
-			}
-			if out.Add(o) {
-				return fs.ErrorListAborted
-			}
-		}
-		return nil
-	}
-
-	var err error
-	switch out.Level() {
-	case 1:
-		err = f.listDir(dir, listItem)
-	case fs.MaxLevel:
-		err = f.list(dir, listItem)
-	default:
-		out.SetError(fs.ErrorLevelNotSupported)
-	}
-	if err != nil {
-		out.SetError(err)
-	}
 }
 
 // NewObject finds the Object at remote.  If it can't be found it
@@ -639,9 +648,11 @@ func (o *Object) MimeType() string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs     = (*Fs)(nil)
-	_ fs.Purger = (*Fs)(nil)
+	_ fs.Fs      = (*Fs)(nil)
+	_ fs.Purger  = (*Fs)(nil)
+	_ fs.ListRer = (*Fs)(nil)
 	//_ fs.Copier = (*Fs)(nil)
+	_ fs.ListRer   = (*Fs)(nil)
 	_ fs.Object    = (*Object)(nil)
 	_ fs.MimeTyper = &Object{}
 )

@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -44,6 +45,12 @@ const (
 	// ConfigClientSecret is the config key used to store the client secret
 	ConfigClientSecret = "client_secret"
 
+	// ConfigAuthURL is the config key used to store the auth server endpoint
+	ConfigAuthURL = "auth_url"
+
+	// ConfigTokenURL is the config key used to store the token server endpoint
+	ConfigTokenURL = "token_url"
+
 	// ConfigAutomatic indicates that we want non-interactive configuration
 	ConfigAutomatic = "config_automatic"
 )
@@ -59,7 +66,6 @@ var (
 	// Flags
 	verbose         = CountP("verbose", "v", "Print lots more stuff (repeat for more)")
 	quiet           = BoolP("quiet", "q", false, "Print as little stuff as possible")
-	logLevel        = StringP("log-level", "", "INFO", "Log level DEBUG|INFO|NOTICE|ERROR")
 	modifyWindow    = DurationP("modify-window", "", time.Nanosecond, "Max time diff to be considered the same")
 	checkers        = IntP("checkers", "", 8, "Number of checkers to run in parallel.")
 	transfers       = IntP("transfers", "", 4, "Number of file transfers to run in parallel.")
@@ -90,6 +96,14 @@ var (
 	noUpdateModTime = BoolP("no-update-modtime", "", false, "Don't update destination mod-time if files identical.")
 	backupDir       = StringP("backup-dir", "", "", "Make backups into hierarchy based in DIR.")
 	suffix          = StringP("suffix", "", "", "Suffix for use with --backup-dir.")
+	useListR        = BoolP("fast-list", "", false, "Use recursive list if available. Uses more memory but fewer transactions.")
+	tpsLimit        = Float64P("tpslimit", "", 0, "Limit HTTP transactions per second to this.")
+	tpsLimitBurst   = IntP("tpslimit-burst", "", 1, "Max burst of transactions for --tpslimit.")
+	bindAddr        = StringP("bind", "", "", "Local address to bind to for outgoing connections, IPv4, IPv6 or name.")
+	disableFeatures = StringP("disable", "", "", "Disable a comma separated list of features.  Use help to see a list.")
+	userAgent       = StringP("user-agent", "", "rclone/"+Version, "Set the user-agent to a specified string. The default is rclone/ version")
+	logLevel        = LogLevelNotice
+	statsLogLevel   = LogLevelInfo
 	bwLimit         BwTimetable
 	bufferSize      SizeSuffix = 16 << 20
 
@@ -99,6 +113,8 @@ var (
 )
 
 func init() {
+	VarP(&logLevel, "log-level", "", "Log level DEBUG|INFO|NOTICE|ERROR")
+	VarP(&statsLogLevel, "stats-log-level", "", "Log level to show --stats output DEBUG|INFO|NOTICE|ERROR")
 	VarP(&bwLimit, "bwlimit", "", "Bandwidth limit in kBytes/s, or use suffix b|k|M|G or a full timetable.")
 	VarP(&bufferSize, "buffer-size", "", "Buffer size when copying files.")
 }
@@ -187,6 +203,7 @@ func MustReveal(x string) string {
 // ConfigInfo is filesystem config options
 type ConfigInfo struct {
 	LogLevel           LogLevel
+	StatsLogLevel      LogLevel
 	DryRun             bool
 	CheckSum           bool
 	SizeOnly           bool
@@ -215,7 +232,12 @@ type ConfigInfo struct {
 	DataRateUnit       string
 	BackupDir          string
 	Suffix             string
+	UseListR           bool
 	BufferSize         SizeSuffix
+	TPSLimit           float64
+	TPSLimitBurst      int
+	BindAddr           net.IP
+	DisableFeatures    []string
 }
 
 // Return the path to the configuration file
@@ -324,19 +346,9 @@ func LoadConfig() {
 		if *quiet {
 			log.Fatalf("Can't set -q and --log-level")
 		}
-		switch strings.ToUpper(*logLevel) {
-		case "ERROR":
-			Config.LogLevel = LogLevelError
-		case "NOTICE":
-			Config.LogLevel = LogLevelNotice
-		case "INFO":
-			Config.LogLevel = LogLevelInfo
-		case "DEBUG":
-			Config.LogLevel = LogLevelDebug
-		default:
-			log.Fatalf("Unknown --log-level %q", *logLevel)
-		}
+		Config.LogLevel = logLevel
 	}
+	Config.StatsLogLevel = statsLogLevel
 	Config.ModifyWindow = *modifyWindow
 	Config.Checkers = *checkers
 	Config.Transfers = *transfers
@@ -361,9 +373,10 @@ func LoadConfig() {
 	Config.NoUpdateModTime = *noUpdateModTime
 	Config.BackupDir = *backupDir
 	Config.Suffix = *suffix
+	Config.UseListR = *useListR
+	Config.TPSLimit = *tpsLimit
+	Config.TPSLimitBurst = *tpsLimitBurst
 	Config.BufferSize = bufferSize
-
-	ConfigPath = *configFile
 
 	Config.TrackRenames = *trackRenames
 
@@ -389,8 +402,30 @@ func LoadConfig() {
 		log.Fatalf(`Can only use --suffix with --backup-dir.`)
 	}
 
+	if *bindAddr != "" {
+		addrs, err := net.LookupIP(*bindAddr)
+		if err != nil {
+			log.Fatalf("--bind: Failed to parse %q as IP address: %v", *bindAddr, err)
+		}
+		if len(addrs) != 1 {
+			log.Fatalf("--bind: Expecting 1 IP address for %q but got %d", *bindAddr, len(addrs))
+		}
+		Config.BindAddr = addrs[0]
+	}
+
+	if *disableFeatures != "" {
+		if *disableFeatures == "help" {
+			log.Fatalf("Possible backend features are: %s\n", strings.Join(new(Features).List(), ", "))
+		}
+		Config.DisableFeatures = strings.Split(*disableFeatures, ",")
+	}
+
 	// Load configuration file.
 	var err error
+	ConfigPath, err = filepath.Abs(*configFile)
+	if err != nil {
+		ConfigPath = *configFile
+	}
 	configData, err = loadConfigFile()
 	if err == errorConfigFileNotFound {
 		Logf(nil, "Config file %q not found - using defaults", ConfigPath)
@@ -410,6 +445,9 @@ func LoadConfig() {
 
 	// Start the bandwidth update ticker
 	startTokenTicker()
+
+	// Start the transactions per second limiter
+	startHTTPTokenBucket()
 }
 
 var errorConfigFileNotFound = errors.New("config file not found")
@@ -466,7 +504,6 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 			err := setConfigPassword(envpw)
 			if err != nil {
 				fmt.Println("Using RCLONE_CONFIG_PASS returned:", err)
-				envpw = ""
 			} else {
 				Debugf(nil, "Using RCLONE_CONFIG_PASS password.")
 			}
@@ -644,7 +681,18 @@ func SaveConfig() {
 		log.Fatalf("Failed to close config file: %v", err)
 	}
 
-	err = os.Chmod(f.Name(), 0600)
+	var fileMode os.FileMode = 0600
+	info, err := os.Stat(ConfigPath)
+	if err != nil {
+		Debugf(nil, "Using default permissions for config file: %v", fileMode)
+	} else if info.Mode() != fileMode {
+		Debugf(nil, "Keeping previous permissions for config file: %v", info.Mode())
+		fileMode = info.Mode()
+	}
+
+	attemptCopyGroup(ConfigPath, f.Name())
+
+	err = os.Chmod(f.Name(), fileMode)
 	if err != nil {
 		Errorf(nil, "Failed to set permissions on config file: %v", err)
 	}
@@ -710,7 +758,7 @@ func ChooseRemote() string {
 }
 
 // ReadLine reads some input
-func ReadLine() string {
+var ReadLine = func() string {
 	buf := bufio.NewReader(os.Stdin)
 	line, err := buf.ReadString('\n')
 	if err != nil {
@@ -1016,22 +1064,25 @@ func DeleteRemote(name string) {
 }
 
 // copyRemote asks the user for a new remote name and copies name into
-// it
-func copyRemote(name string) {
+// it. Returns the new name.
+func copyRemote(name string) string {
 	newName := NewRemoteName()
 	// Copy the keys
 	for _, key := range configData.GetKeyList(name) {
 		value := configData.MustValue(name, key, "")
 		configData.SetValue(newName, key, value)
 	}
+	return newName
 }
 
 // RenameRemote renames a config section
 func RenameRemote(name string) {
 	fmt.Printf("Enter new name for %q remote.\n", name)
-	copyRemote(name)
-	configData.DeleteSection(name)
-	SaveConfig()
+	newName := copyRemote(name)
+	if name != newName {
+		configData.DeleteSection(name)
+		SaveConfig()
+	}
 }
 
 // CopyRemote copies a config section
@@ -1052,7 +1103,8 @@ func EditConfig() {
 			fmt.Printf("\n")
 		} else {
 			fmt.Printf("No remotes found - make a new one\n")
-			what = append(what[1:2], what[3:]...)
+			// take 2nd item and last 2 items of menu list
+			what = append(what[1:2], what[len(what)-2:]...)
 		}
 		switch i := Command(what); i {
 		case 'e':

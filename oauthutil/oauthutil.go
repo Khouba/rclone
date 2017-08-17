@@ -80,7 +80,7 @@ func getToken(name string) (*oauth2.Token, error) {
 	token.RefreshToken = oldtoken.RefreshToken
 	token.Expiry = oldtoken.Expiry
 	// Save new format in config file
-	err = putToken(name, token)
+	err = putToken(name, token, false)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +90,7 @@ func getToken(name string) (*oauth2.Token, error) {
 // putToken stores the token in the config file
 //
 // This saves the config file if it changes
-func putToken(name string, token *oauth2.Token) error {
+func putToken(name string, token *oauth2.Token, newSection bool) error {
 	tokenBytes, err := json.Marshal(token)
 	if err != nil {
 		return err
@@ -99,7 +99,9 @@ func putToken(name string, token *oauth2.Token) error {
 	old := fs.ConfigFileGet(name, fs.ConfigToken)
 	if tokenString != old {
 		err = fs.ConfigSetValueAndSave(name, fs.ConfigToken, tokenString)
-		if err != nil {
+		if newSection && err != nil {
+			fs.Debugf(name, "Added new token to config, still needs to be saved")
+		} else if err != nil {
 			fs.Errorf(nil, "Failed to save new token in config file: %v", err)
 		} else {
 			fs.Debugf(name, "Saved new token in config file")
@@ -201,7 +203,7 @@ func (ts *TokenSource) Token() (*oauth2.Token, error) {
 		if ts.expiryTimer != nil {
 			ts.expiryTimer.Reset(ts.timeToExpiry())
 		}
-		err = putToken(ts.name, token)
+		err = putToken(ts.name, token, false)
 		if err != nil {
 			return nil, err
 		}
@@ -247,7 +249,7 @@ var _ oauth2.TokenSource = (*TokenSource)(nil)
 
 // Context returns a context with our HTTP Client baked in for oauth2
 func Context() context.Context {
-	return context.WithValue(nil, oauth2.HTTPClient, fs.Config.Client())
+	return context.WithValue(context.Background(), oauth2.HTTPClient, fs.Config.Client())
 }
 
 // overrideCredentials sets the ClientID and ClientSecret from the
@@ -266,6 +268,16 @@ func overrideCredentials(name string, origConfig *oauth2.Config) (config *oauth2
 	ClientSecret := fs.ConfigFileGet(name, fs.ConfigClientSecret)
 	if ClientSecret != "" {
 		config.ClientSecret = ClientSecret
+		changed = true
+	}
+	AuthURL := fs.ConfigFileGet(name, fs.ConfigAuthURL)
+	if AuthURL != "" {
+		config.Endpoint.AuthURL = AuthURL
+		changed = true
+	}
+	TokenURL := fs.ConfigFileGet(name, fs.ConfigTokenURL)
+	if TokenURL != "" {
+		config.Endpoint.TokenURL = TokenURL
 		changed = true
 	}
 	return config, changed
@@ -298,7 +310,17 @@ func NewClient(name string, config *oauth2.Config) (*http.Client, *TokenSource, 
 // Config does the initial creation of the token
 //
 // It may run an internal webserver to receive the results
-func Config(id, name string, config *oauth2.Config) error {
+func Config(id, name string, config *oauth2.Config, opts ...oauth2.AuthCodeOption) error {
+	return doConfig(id, name, config, true, opts)
+}
+
+// ConfigNoOffline does the same as Config but does not pass the
+// "access_type=offline" parameter.
+func ConfigNoOffline(id, name string, config *oauth2.Config, opts ...oauth2.AuthCodeOption) error {
+	return doConfig(id, name, config, false, opts)
+}
+
+func doConfig(id, name string, config *oauth2.Config, offline bool, opts []oauth2.AuthCodeOption) error {
 	config, changed := overrideCredentials(name, config)
 	automatic := fs.ConfigFileGet(name, fs.ConfigAutomatic) != ""
 
@@ -346,7 +368,7 @@ func Config(id, name string, config *oauth2.Config) error {
 			if err != nil {
 				return err
 			}
-			return putToken(name, token)
+			return putToken(name, token, false)
 		}
 	case TitleBarRedirectURL:
 		useWebServer = automatic
@@ -371,7 +393,10 @@ func Config(id, name string, config *oauth2.Config) error {
 		return err
 	}
 	state := fmt.Sprintf("%x", stateBytes)
-	authURL := config.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	if offline {
+		opts = append(opts, oauth2.AccessTypeOffline)
+	}
+	authURL := config.AuthCodeURL(state, opts...)
 
 	// Prepare webserver
 	server := authServer{
@@ -419,7 +444,7 @@ func Config(id, name string, config *oauth2.Config) error {
 		}
 		fmt.Printf("Paste the following into your remote machine --->\n%s\n<---End paste", result)
 	}
-	return putToken(name, token)
+	return putToken(name, token, true)
 }
 
 // Local web server for collecting auth
@@ -429,17 +454,18 @@ type authServer struct {
 	bindAddress string
 	code        chan string
 	authURL     string
+	server      *http.Server
 }
 
 // startWebServer runs an internal web server to receive config details
 func (s *authServer) Start() {
 	fs.Debugf(nil, "Starting auth server on %s", s.bindAddress)
 	mux := http.NewServeMux()
-	server := &http.Server{
+	s.server = &http.Server{
 		Addr:    s.bindAddress,
 		Handler: mux,
 	}
-	server.SetKeepAlivesEnabled(false)
+	s.server.SetKeepAlivesEnabled(false)
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "", 404)
 		return
@@ -479,15 +505,6 @@ func (s *authServer) Start() {
 	if err != nil {
 		log.Fatalf("Failed to start auth webserver: %v", err)
 	}
-	err = server.Serve(s.listener)
+	err = s.server.Serve(s.listener)
 	fs.Debugf(nil, "Closed auth server with error: %v", err)
-}
-
-func (s *authServer) Stop() {
-	fs.Debugf(nil, "Closing auth server")
-	if s.code != nil {
-		close(s.code)
-		s.code = nil
-	}
-	_ = s.listener.Close()
 }

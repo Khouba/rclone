@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ncw/rclone/fs"
@@ -19,6 +20,7 @@ import (
 // Constants
 const (
 	directoryMarkerContentType = "application/directory" // content type of directory marker objects
+	listChunks                 = 1000                    // chunk size to read directory listings
 )
 
 // Globals
@@ -33,6 +35,18 @@ func init() {
 		Description: "Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
+			Name: "env_auth",
+			Help: "Get swift credentials from environment variables in standard OpenStack form.",
+			Examples: []fs.OptionExample{
+				{
+					Value: "false",
+					Help:  "Enter swift credentials in the next step",
+				}, {
+					Value: "true",
+					Help:  "Get swift credentials from environment vars. Leave other fields blank if using this.",
+				},
+			},
+		}, {
 			Name: "user",
 			Help: "User name to log in.",
 		}, {
@@ -78,10 +92,22 @@ func init() {
 		}, {
 			Name: "auth_version",
 			Help: "AuthVersion - optional - set to (1,2,3) if your auth URL has no version",
+		}, {
+			Name: "endpoint_type",
+			Help: "Endpoint type to choose from the service catalogue",
+			Examples: []fs.OptionExample{{
+				Help:  "Public (default, choose this if not sure)",
+				Value: "public",
+			}, {
+				Help:  "Internal (use internal service net)",
+				Value: "internal",
+			}, {
+				Help:  "Admin",
+				Value: "admin",
+			}},
 		},
 		},
 	})
-	// snet     = flag.Bool("swift-snet", false, "Use internal service network") // FIXME not implemented
 	fs.VarP(&chunkSize, "swift-chunk-size", "", "Above this size files will be chunked into a _segments container.")
 }
 
@@ -92,6 +118,8 @@ type Fs struct {
 	features          *fs.Features      // optional features
 	c                 *swift.Connection // the connection to the swift server
 	container         string            // the container we are working on
+	containerOKMu     sync.Mutex        // mutex to protect container OK
+	containerOK       bool              // true if we have created the container
 	segmentsContainer string            // container to store the segments (if any) in
 }
 
@@ -150,30 +178,34 @@ func parsePath(path string) (container, directory string, err error) {
 
 // swiftConnection makes a connection to swift
 func swiftConnection(name string) (*swift.Connection, error) {
-	userName := fs.ConfigFileGet(name, "user")
-	if userName == "" {
-		return nil, errors.New("user not found")
-	}
-	apiKey := fs.ConfigFileGet(name, "key")
-	if apiKey == "" {
-		return nil, errors.New("key not found")
-	}
-	authURL := fs.ConfigFileGet(name, "auth")
-	if authURL == "" {
-		return nil, errors.New("auth not found")
-	}
 	c := &swift.Connection{
-		UserName:       userName,
-		ApiKey:         apiKey,
-		AuthUrl:        authURL,
+		UserName:       fs.ConfigFileGet(name, "user"),
+		ApiKey:         fs.ConfigFileGet(name, "key"),
+		AuthUrl:        fs.ConfigFileGet(name, "auth"),
 		AuthVersion:    fs.ConfigFileGetInt(name, "auth_version", 0),
 		Tenant:         fs.ConfigFileGet(name, "tenant"),
 		Region:         fs.ConfigFileGet(name, "region"),
 		Domain:         fs.ConfigFileGet(name, "domain"),
 		TenantDomain:   fs.ConfigFileGet(name, "tenant_domain"),
+		EndpointType:   swift.EndpointType(fs.ConfigFileGet(name, "endpoint_type", "public")),
 		ConnectTimeout: 10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
 		Timeout:        10 * fs.Config.Timeout,        // Use the timeouts in the transport
 		Transport:      fs.Config.Transport(),
+	}
+	if fs.ConfigFileGetBool(name, "env_auth", false) {
+		err := c.ApplyEnvironment()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read environment variables")
+		}
+	}
+	if c.UserName == "" {
+		return nil, errors.New("user not found")
+	}
+	if c.ApiKey == "" {
+		return nil, errors.New("key not found")
+	}
+	if c.AuthUrl == "" {
+		return nil, errors.New("auth not found")
 	}
 	err := c.Authenticate()
 	if err != nil {
@@ -196,7 +228,11 @@ func NewFsWithConnection(name, root string, c *swift.Connection) (fs.Fs, error) 
 		segmentsContainer: container + "_segments",
 		root:              directory,
 	}
-	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		ReadMimeType:  true,
+		WriteMimeType: true,
+		BucketBased:   true,
+	}).Fill(f)
 	// StorageURL overloading
 	storageURL := fs.ConfigFileGet(name, "storage_url")
 	if storageURL != "" {
@@ -269,8 +305,8 @@ type listFn func(remote string, object *swift.Object, isDirectory bool) error
 // listContainerRoot lists the objects into the function supplied from
 // the container and root supplied
 //
-// Level is the level of the recursion
-func (f *Fs) listContainerRoot(container, root string, dir string, level int, fn listFn) error {
+// Set recurse to read sub directories
+func (f *Fs) listContainerRoot(container, root string, dir string, recurse bool, fn listFn) error {
 	prefix := root
 	if dir != "" {
 		prefix += dir + "/"
@@ -278,14 +314,10 @@ func (f *Fs) listContainerRoot(container, root string, dir string, level int, fn
 	// Options for ObjectsWalk
 	opts := swift.ObjectsOpts{
 		Prefix: prefix,
-		Limit:  256,
+		Limit:  listChunks,
 	}
-	switch level {
-	case 1:
+	if !recurse {
 		opts.Delimiter = '/'
-	case fs.MaxLevel:
-	default:
-		return fs.ErrorLevelNotSupported
 	}
 	rootLength := len(root)
 	return f.c.ObjectsWalk(container, &opts, func(opts *swift.ObjectsOpts) (interface{}, error) {
@@ -294,14 +326,17 @@ func (f *Fs) listContainerRoot(container, root string, dir string, level int, fn
 			for i := range objects {
 				object := &objects[i]
 				isDirectory := false
-				if level == 1 {
-					if strings.HasSuffix(object.Name, "/") {
-						isDirectory = true
-						object.Name = object.Name[:len(object.Name)-1]
-					}
+				if !recurse {
+					isDirectory = strings.HasSuffix(object.Name, "/")
 				}
-				if !strings.HasPrefix(object.Name, root) {
+				if !strings.HasPrefix(object.Name, prefix) {
 					fs.Logf(f, "Odd name received %q", object.Name)
+					continue
+				}
+				if object.Name == prefix {
+					// If we have zero length directory markers ending in / then swift
+					// will return them in the listing for the directory which causes
+					// duplicate directories.  Ignore them here.
 					continue
 				}
 				remote := object.Name[rootLength:]
@@ -315,29 +350,15 @@ func (f *Fs) listContainerRoot(container, root string, dir string, level int, fn
 	})
 }
 
-// list the objects into the function supplied
-func (f *Fs) list(dir string, level int, fn listFn) error {
-	return f.listContainerRoot(f.container, f.root, dir, level, fn)
-}
+type addEntryFn func(fs.DirEntry) error
 
-// listFiles walks the path returning a channel of Objects
-func (f *Fs) listFiles(out fs.ListOpts, dir string) {
-	defer out.Finished()
-	if f.container == "" {
-		out.SetError(errors.New("can't list objects at root - choose a container using lsd"))
-		return
-	}
-	// List the objects
-	err := f.list(dir, out.Level(), func(remote string, object *swift.Object, isDirectory bool) error {
+// list the objects into the function supplied
+func (f *Fs) list(dir string, recurse bool, fn addEntryFn) error {
+	return f.listContainerRoot(f.container, f.root, dir, recurse, func(remote string, object *swift.Object, isDirectory bool) (err error) {
 		if isDirectory {
-			dir := &fs.Dir{
-				Name:  remote,
-				Bytes: object.Bytes,
-				Count: 0,
-			}
-			if out.AddDir(dir) {
-				return fs.ErrorListAborted
-			}
+			remote = strings.TrimRight(remote, "/")
+			d := fs.NewDir(remote, time.Time{}).SetSize(object.Bytes)
+			err = fn(d)
 		} else {
 			o, err := f.newObjectWithInfo(remote, object)
 			if err != nil {
@@ -345,53 +366,92 @@ func (f *Fs) listFiles(out fs.ListOpts, dir string) {
 			}
 			// Storable does a full metadata read on 0 size objects which might be dynamic large objects
 			if o.Storable() {
-				if out.Add(o) {
-					return fs.ErrorListAborted
-				}
+				err = fn(o)
 			}
 		}
+		return err
+	})
+}
+
+// listDir lists a single directory
+func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
+	if f.container == "" {
+		return nil, fs.ErrorListBucketRequired
+	}
+	// List the objects
+	err = f.list(dir, false, func(entry fs.DirEntry) error {
+		entries = append(entries, entry)
 		return nil
 	})
 	if err != nil {
 		if err == swift.ContainerNotFound {
 			err = fs.ErrorDirNotFound
 		}
-		out.SetError(err)
+		return nil, err
 	}
+	return entries, nil
 }
 
 // listContainers lists the containers
-func (f *Fs) listContainers(out fs.ListOpts, dir string) {
-	defer out.Finished()
+func (f *Fs) listContainers(dir string) (entries fs.DirEntries, err error) {
 	if dir != "" {
-		out.SetError(fs.ErrorListOnlyRoot)
-		return
+		return nil, fs.ErrorListBucketRequired
 	}
 	containers, err := f.c.ContainersAll(nil)
 	if err != nil {
-		out.SetError(err)
-		return
+		return nil, errors.Wrap(err, "container listing failed")
 	}
 	for _, container := range containers {
-		dir := &fs.Dir{
-			Name:  container.Name,
-			Bytes: container.Bytes,
-			Count: container.Count,
-		}
-		if out.AddDir(dir) {
-			break
-		}
+		d := fs.NewDir(container.Name, time.Time{}).SetSize(container.Bytes).SetItems(container.Count)
+		entries = append(entries, d)
 	}
+	return entries, nil
 }
 
-// List walks the path returning files and directories to out
-func (f *Fs) List(out fs.ListOpts, dir string) {
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if f.container == "" {
-		f.listContainers(out, dir)
-	} else {
-		f.listFiles(out, dir)
+		return f.listContainers(dir)
 	}
-	return
+	return f.listDir(dir)
+}
+
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
+	if f.container == "" {
+		return errors.New("container needed for recursive list")
+	}
+	list := fs.NewListRHelper(callback)
+	err = f.list(dir, true, func(entry fs.DirEntry) error {
+		return list.Add(entry)
+	})
+	if err != nil {
+		return err
+	}
+	return list.Flush()
 }
 
 // Put the object into the container
@@ -410,30 +470,40 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(dir string) error {
-	// Can't create subdirs
-	if dir != "" {
+	f.containerOKMu.Lock()
+	defer f.containerOKMu.Unlock()
+	if f.containerOK {
+		return nil
+	}
+	// if we are at the root, then it is OK
+	if f.container == "" {
 		return nil
 	}
 	// Check to see if container exists first
 	_, _, err := f.c.Container(f.container)
-	if err == nil {
-		return nil
-	}
 	if err == swift.ContainerNotFound {
-		return f.c.ContainerCreate(f.container, nil)
+		err = f.c.ContainerCreate(f.container, nil)
+	}
+	if err == nil {
+		f.containerOK = true
 	}
 	return err
-
 }
 
 // Rmdir deletes the container if the fs is at the root
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(dir string) error {
+	f.containerOKMu.Lock()
+	defer f.containerOKMu.Unlock()
 	if f.root != "" || dir != "" {
 		return nil
 	}
-	return f.c.ContainerDelete(f.container)
+	err := f.c.ContainerDelete(f.container)
+	if err == nil {
+		f.containerOK = false
+	}
+	return err
 }
 
 // Precision of the remote
@@ -451,12 +521,8 @@ func (f *Fs) Purge() error {
 	go func() {
 		delErr <- fs.DeleteFiles(toBeDeleted)
 	}()
-	err := f.list("", fs.MaxLevel, func(remote string, object *swift.Object, isDirectory bool) error {
-		if !isDirectory {
-			o, err := f.newObjectWithInfo(remote, object)
-			if err != nil {
-				return err
-			}
+	err := f.list("", true, func(entry fs.DirEntry) error {
+		if o, ok := entry.(*Object); ok {
 			toBeDeleted <- o
 		}
 		return nil
@@ -482,13 +548,17 @@ func (f *Fs) Purge() error {
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	err := f.Mkdir("")
+	if err != nil {
+		return nil, err
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
 	srcFs := srcObj.fs
-	_, err := f.c.ObjectCopy(srcFs.container, srcFs.root+srcObj.remote, f.container, f.root+remote, nil)
+	_, err = f.c.ObjectCopy(srcFs.container, srcFs.root+srcObj.remote, f.container, f.root+remote, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -659,7 +729,7 @@ func min(x, y int64) int64 {
 // if except is passed in then segments with that prefix won't be deleted
 func (o *Object) removeSegments(except string) error {
 	segmentsRoot := o.fs.root + o.remote + "/"
-	err := o.fs.listContainerRoot(o.fs.segmentsContainer, segmentsRoot, "", fs.MaxLevel, func(remote string, object *swift.Object, isDirectory bool) error {
+	err := o.fs.listContainerRoot(o.fs.segmentsContainer, segmentsRoot, "", true, func(remote string, object *swift.Object, isDirectory bool) error {
 		if isDirectory {
 			return nil
 		}
@@ -738,6 +808,13 @@ func (o *Object) updateChunks(in io.Reader, headers swift.Headers, size int64, c
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if o.fs.container == "" {
+		return fs.FatalError(errors.New("container name needed in remote"))
+	}
+	err := o.fs.Mkdir("")
+	if err != nil {
+		return err
+	}
 	size := src.Size()
 	modTime := src.ModTime()
 
@@ -810,6 +887,7 @@ var (
 	_ fs.Fs        = &Fs{}
 	_ fs.Purger    = &Fs{}
 	_ fs.Copier    = &Fs{}
+	_ fs.ListRer   = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.MimeTyper = &Object{}
 )

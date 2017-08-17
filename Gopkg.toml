@@ -49,8 +49,6 @@
 ## what source location any dependent projects specify.
 # source = "https://github.com/myfork/package.git"
 
-
-
 [[constraint]]
   branch = "master"
   name = "bazil.org/fuse"
@@ -109,10 +107,6 @@
 
 [[constraint]]
   branch = "master"
-  name = "github.com/tsenart/tb"
-
-[[constraint]]
-  branch = "master"
   name = "golang.org/x/crypto"
 
 [[constraint]]
@@ -137,4 +131,8 @@
 
 [[constraint]]
   branch = "master"
-  name = "github.com/ncw/dropbox-sdk-go-unofficial"
+  name = "github.com/dropbox/dropbox-sdk-go-unofficial"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/yunify/qingstor-sdk-go"

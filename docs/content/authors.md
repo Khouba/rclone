@@ -82,3 +82,17 @@ Contributors
   * Sjur Fredriksen <sjurtf@ifi.uio.no>
   * Ruwbin <hubus12345@gmail.com>
   * Fabian Möller <fabianm88@gmail.com>
+  * Edward Q. Bridges <github@eqbridges.com>
+  * Vasiliy Tolstov <v.tolstov@selfip.ru>
+  * Harshavardhana <harsha@minio.io>
+  * sainaen <sainaen@gmail.com>
+  * gdm85 <gdm85@users.noreply.github.com>
+  * Yaroslav Halchenko <debian@onerussian.com>
+  * John Papandriopoulos <jpap@users.noreply.github.com>
+  * Zhiming Wang <zmwangx@gmail.com>
+  * Andy Pilate <cubox@cubox.me>
+  * Oliver Heyme <olihey@googlemail.com>
+  * wuyu <wuyu@yunify.com>
+  * Andrei Dragomir <adragomi@adobe.com>
+  * Christian Brüggemann <mail@cbruegg.com>
+  * Alex McGrath Kraak <amkdude@gmail.com>

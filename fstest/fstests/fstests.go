@@ -7,12 +7,12 @@ package fstests
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -35,7 +35,9 @@ var (
 	NilObject fs.Object
 	// ExtraConfig is for adding config to a remote
 	ExtraConfig = []ExtraConfigItem{}
-	file1       = fstest.Item{
+	// SkipBadWindowsCharacters skips unusable characters for windows if set
+	SkipBadWindowsCharacters = map[string]bool{}
+	file1                    = fstest.Item{
 		ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
 		Path:    "file name.txt",
 	}
@@ -46,50 +48,57 @@ var (
 		WinPath: `hello_ sausage/êé/Hello, 世界/ _ ' @ _ _ & _ + ≠/z.txt`,
 	}
 	file2Contents = ""
-	verbose       = flag.Bool("verbose", false, "Set to enable logging")
-	dumpHeaders   = flag.Bool("dump-headers", false, "Dump HTTP headers - may contain sensitive info")
-	dumpBodies    = flag.Bool("dump-bodies", false, "Dump HTTP headers and bodies - may contain sensitive info")
+	isLocalRemote bool
 )
 
 // ExtraConfigItem describes a config item added on the fly while testing
 type ExtraConfigItem struct{ Name, Key, Value string }
 
-func init() {
-	flag.StringVar(&RemoteName, "remote", "", "Set this to override the default remote name (eg s3:)")
-}
-
-// TestInit tests basic intitialisation
-func TestInit(t *testing.T) {
+// Make the Fs we are testing with, initialising the global variables
+// subRemoteName - name of the remote after the TestRemote:
+// subRemoteLeaf - a subdirectory to use under that
+// remote - the result of  fs.NewFs(TestRemote:subRemoteName)
+func newFs(t *testing.T) {
 	var err error
-
-	// Never ask for passwords, fail instead.
-	// If your local config is encrypted set environment variable
-	// "RCLONE_CONFIG_PASS=hunter2" (or your password)
-	*fs.AskPassword = false
-	fs.LoadConfig()
-	// Set extra config if supplied
-	for _, item := range ExtraConfig {
-		fs.ConfigFileSet(item.Name, item.Key, item.Value)
-	}
-	if *verbose {
-		fs.Config.LogLevel = fs.LogLevelDebug
-	}
-	fs.Config.DumpHeaders = *dumpHeaders
-	fs.Config.DumpBodies = *dumpBodies
-	t.Logf("Using remote %q", RemoteName)
-	if RemoteName == "" {
-		RemoteName, err = fstest.LocalRemote()
-		require.NoError(t, err)
-	}
 	subRemoteName, subRemoteLeaf, err = fstest.RandomRemoteName(RemoteName)
 	require.NoError(t, err)
-
 	remote, err = fs.NewFs(subRemoteName)
 	if err == fs.ErrorNotFoundInConfigFile {
 		t.Logf("Didn't find %q in config file - skipping tests", RemoteName)
 		return
 	}
 	require.NoError(t, err, fmt.Sprintf("unexpected error: %v", err))
+}
+
+// TestInit tests basic intitialisation
+func TestInit(t *testing.T) {
+	var err error
+
+	// Remove bad characters from Windows file name if set
+	if SkipBadWindowsCharacters[RemoteName] {
+		t.Logf("Removing bad windows characters from test file")
+		file2.Path = winPath(file2.Path)
+	}
+
+	fstest.Initialise()
+
+	// Set extra config if supplied
+	for _, item := range ExtraConfig {
+		fs.ConfigFileSet(item.Name, item.Key, item.Value)
+	}
+	if *fstest.RemoteName != "" {
+		RemoteName = *fstest.RemoteName
+	}
+	t.Logf("Using remote %q", RemoteName)
+	if RemoteName == "" {
+		RemoteName, err = fstest.LocalRemote()
+		require.NoError(t, err)
+		isLocalRemote = true
+	}
+
+	newFs(t)
+
+	skipIfNotOk(t)
 	fstest.TestMkdir(t, remote)
 }
 
@@ -99,11 +108,49 @@ func skipIfNotOk(t *testing.T) {
 	}
 }
 
+// Skip if remote is not ListR capable, otherwise set the useListR
+// flag, returning a function to restore its value
+func skipIfNotListR(t *testing.T) func() {
+	skipIfNotOk(t)
+	if remote.Features().ListR == nil {
+		t.Skip("FS has no ListR interface")
+	}
+	previous := fs.Config.UseListR
+	fs.Config.UseListR = true
+	return func() {
+		fs.Config.UseListR = previous
+	}
+}
+
 // TestFsString tests the String method
 func TestFsString(t *testing.T) {
 	skipIfNotOk(t)
 	str := remote.String()
-	require.NotEqual(t, str, "")
+	require.NotEqual(t, "", str)
+}
+
+// TestFsName tests the Name method
+func TestFsName(t *testing.T) {
+	skipIfNotOk(t)
+	got := remote.Name()
+	want := RemoteName
+	if isLocalRemote {
+		want = "local:"
+	}
+	require.Equal(t, want, got+":")
+}
+
+// TestFsRoot tests the Root method
+func TestFsRoot(t *testing.T) {
+	skipIfNotOk(t)
+	name := remote.Name() + ":"
+	root := remote.Root()
+	if isLocalRemote {
+		// only check last path element on local
+		require.Equal(t, filepath.Base(subRemoteName), filepath.Base(root))
+	} else {
+		require.Equal(t, subRemoteName, name+root)
+	}
 }
 
 // TestFsRmdirEmpty tests deleting an empty directory
@@ -122,6 +169,12 @@ func TestFsRmdirNotFound(t *testing.T) {
 // TestFsMkdir tests tests making a directory
 func TestFsMkdir(t *testing.T) {
 	skipIfNotOk(t)
+
+	// Use a new directory here.  This is for the container based
+	// remotes which take time to create and destroy a container
+	// (eg azure blob)
+	newFs(t)
+
 	fstest.TestMkdir(t, remote)
 	fstest.TestMkdir(t, remote)
 }
@@ -151,18 +204,20 @@ func TestFsListEmpty(t *testing.T) {
 
 // winPath converts a path into a windows safe path
 func winPath(s string) string {
-	s = strings.Replace(s, "?", "_", -1)
-	s = strings.Replace(s, `"`, "_", -1)
-	s = strings.Replace(s, "<", "_", -1)
-	s = strings.Replace(s, ">", "_", -1)
-	return s
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '<', '>', '"', '|', '?', '*', ':':
+			return '_'
+		}
+		return r
+	}, s)
 }
 
 // dirsToNames returns a sorted list of names
-func dirsToNames(dirs []*fs.Dir) []string {
+func dirsToNames(dirs []fs.Directory) []string {
 	names := []string{}
 	for _, dir := range dirs {
-		names = append(names, winPath(dir.Name))
+		names = append(names, winPath(dir.Remote()))
 	}
 	sort.Strings(names)
 	return names
@@ -181,10 +236,16 @@ func objsToNames(objs []fs.Object) []string {
 // TestFsListDirEmpty tests listing the directories from an empty directory
 func TestFsListDirEmpty(t *testing.T) {
 	skipIfNotOk(t)
-	objs, dirs, err := fs.NewLister().SetLevel(1).Start(remote, "").GetAll()
+	objs, dirs, err := fs.WalkGetAll(remote, "", true, 1)
 	require.NoError(t, err)
 	assert.Equal(t, []string{}, objsToNames(objs))
 	assert.Equal(t, []string{}, dirsToNames(dirs))
+}
+
+// TestFsListRDirEmpty tests listing the directories from an empty directory using ListR
+func TestFsListRDirEmpty(t *testing.T) {
+	defer skipIfNotListR(t)()
+	TestFsListDirEmpty(t)
 }
 
 // TestFsNewObjectNotFound tests not finding a object
@@ -216,14 +277,14 @@ func findObject(t *testing.T, Name string) fs.Object {
 }
 
 func testPut(t *testing.T, file *fstest.Item) string {
+	tries := 1
+	const maxTries = 10
 again:
 	contents := fstest.RandomString(100)
 	buf := bytes.NewBufferString(contents)
 	hash := fs.NewMultiHasher()
 	in := io.TeeReader(buf, hash)
 
-	tries := 1
-	const maxTries = 10
 	file.Size = int64(buf.Len())
 	obji := fs.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
 	obj, err := remote.Put(in, obji)
@@ -274,11 +335,11 @@ func TestFsPutError(t *testing.T) {
 	in := io.MultiReader(buf, er)
 
 	obji := fs.NewStaticObjectInfo(file2.Path, file2.ModTime, 100, true, nil, nil)
-	obj, err := remote.Put(in, obji)
+	_, err := remote.Put(in, obji)
 	// assert.Nil(t, obj) - FIXME some remotes return the object even on nil
 	assert.NotNil(t, err)
 
-	obj, err = remote.NewObject(file2.Path)
+	obj, err := remote.NewObject(file2.Path)
 	assert.Nil(t, obj)
 	assert.Equal(t, fs.ErrorObjectNotFound, err)
 }
@@ -303,9 +364,9 @@ func TestFsListDirFile2(t *testing.T) {
 	list := func(dir string, expectedDirNames, expectedObjNames []string) {
 		var objNames, dirNames []string
 		for i := 1; i <= *fstest.ListRetries; i++ {
-			objs, dirs, err := fs.NewLister().SetLevel(1).Start(remote, dir).GetAll()
-			if err == fs.ErrorDirNotFound {
-				objs, dirs, err = fs.NewLister().SetLevel(1).Start(remote, winPath(dir)).GetAll()
+			objs, dirs, err := fs.WalkGetAll(remote, dir, true, 1)
+			if errors.Cause(err) == fs.ErrorDirNotFound {
+				objs, dirs, err = fs.WalkGetAll(remote, winPath(dir), true, 1)
 			}
 			require.NoError(t, err)
 			objNames = objsToNames(objs)
@@ -340,14 +401,27 @@ func TestFsListDirFile2(t *testing.T) {
 	}
 }
 
+// TestFsListRDirFile2 tests the files are correctly uploaded by doing
+// Depth 1 directory listings using ListR
+func TestFsListRDirFile2(t *testing.T) {
+	defer skipIfNotListR(t)()
+	TestFsListDirFile2(t)
+}
+
 // TestFsListDirRoot tests that DirList works in the root
 func TestFsListDirRoot(t *testing.T) {
 	skipIfNotOk(t)
 	rootRemote, err := fs.NewFs(RemoteName)
 	require.NoError(t, err)
-	dirs, err := fs.NewLister().SetLevel(1).Start(rootRemote, "").GetDirs()
+	_, dirs, err := fs.WalkGetAll(rootRemote, "", true, 1)
 	require.NoError(t, err)
 	assert.Contains(t, dirsToNames(dirs), subRemoteLeaf, "Remote leaf not found")
+}
+
+// TestFsListRDirRoot tests that DirList works in the root using ListR
+func TestFsListRDirRoot(t *testing.T) {
+	defer skipIfNotListR(t)()
+	TestFsListDirRoot(t)
 }
 
 // TestFsListSubdir tests List works for a subdirectory
@@ -356,11 +430,11 @@ func TestFsListSubdir(t *testing.T) {
 	fileName := file2.Path
 	var err error
 	var objs []fs.Object
-	var dirs []*fs.Dir
+	var dirs []fs.Directory
 	for i := 0; i < 2; i++ {
 		dir, _ := path.Split(fileName)
 		dir = dir[:len(dir)-1]
-		objs, dirs, err = fs.NewLister().Start(remote, dir).GetAll()
+		objs, dirs, err = fs.WalkGetAll(remote, dir, true, -1)
 		if err != fs.ErrorDirNotFound {
 			break
 		}
@@ -372,16 +446,28 @@ func TestFsListSubdir(t *testing.T) {
 	require.Len(t, dirs, 0)
 }
 
+// TestFsListRSubdir tests List works for a subdirectory using ListR
+func TestFsListRSubdir(t *testing.T) {
+	defer skipIfNotListR(t)()
+	TestFsListSubdir(t)
+}
+
 // TestFsListLevel2 tests List works for 2 levels
 func TestFsListLevel2(t *testing.T) {
 	skipIfNotOk(t)
-	objs, dirs, err := fs.NewLister().SetLevel(2).Start(remote, "").GetAll()
+	objs, dirs, err := fs.WalkGetAll(remote, "", true, 2)
 	if err == fs.ErrorLevelNotSupported {
 		return
 	}
 	require.NoError(t, err)
 	assert.Equal(t, []string{file1.Path}, objsToNames(objs))
 	assert.Equal(t, []string{`hello_ sausage`, `hello_ sausage/êé`}, dirsToNames(dirs))
+}
+
+// TestFsListRLevel2 tests List works for 2 levels using ListR
+func TestFsListRLevel2(t *testing.T) {
+	defer skipIfNotListR(t)()
+	TestFsListLevel2(t)
 }
 
 // TestFsListFile1 tests file present
@@ -672,7 +758,7 @@ func TestObjectSetModTime(t *testing.T) {
 	newModTime := fstest.Time("2011-12-13T14:15:16.999999999Z")
 	obj := findObject(t, file1.Path)
 	err := obj.SetModTime(newModTime)
-	if err == fs.ErrorCantSetModTime {
+	if err == fs.ErrorCantSetModTime || err == fs.ErrorCantSetModTimeWithoutDelete {
 		t.Log(err)
 		return
 	}
@@ -789,6 +875,47 @@ func TestObjectRemove(t *testing.T) {
 	err := obj.Remove()
 	require.NoError(t, err)
 	fstest.CheckListing(t, remote, []fstest.Item{file2})
+}
+
+// TestFsPutUnknownLengthFile tests uploading files when size is not known in advance
+func TestFsPutUnknownLengthFile(t *testing.T) {
+	skipIfNotOk(t)
+
+	file := fstest.Item{
+		ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+		Path:    "piped data.txt",
+		Size:    -1, // use unknown size during upload
+	}
+
+	tries := 1
+	const maxTries = 10
+again:
+	contentSize := 100
+	contents := fstest.RandomString(contentSize)
+	buf := bytes.NewBufferString(contents)
+	hash := fs.NewMultiHasher()
+	in := io.TeeReader(buf, hash)
+
+	file.Size = -1
+	obji := fs.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
+	obj, err := remote.Put(in, obji)
+	if err != nil {
+		// Retry if err returned a retry error
+		if fs.IsRetryError(err) && tries < maxTries {
+			t.Logf("Put error: %v - low level retry %d/%d", err, tries, maxTries)
+			time.Sleep(2 * time.Second)
+
+			tries++
+			goto again
+		}
+		require.NoError(t, err, fmt.Sprintf("Put Unknown Length error: %v", err))
+	}
+	file.Hashes = hash.Sums()
+	file.Size = int64(contentSize) // use correct size when checking
+	file.Check(t, obj, remote.Precision())
+	// Re-read the object and check again
+	obj = findObject(t, file.Path)
+	file.Check(t, obj, remote.Precision())
 }
 
 // TestObjectPurge tests Purge

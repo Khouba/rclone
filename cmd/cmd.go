@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/pprof"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -42,19 +41,23 @@ var Root = &cobra.Command{
 Rclone is a command line program to sync files and directories to and
 from various cloud storage systems and using file transfer services, such as:
 
-  * Google Drive
-  * Amazon S3
-  * Openstack Swift / Rackspace cloud files / Memset Memstore
-  * Dropbox
-  * Google Cloud Storage
   * Amazon Drive
-  * Microsoft OneDrive
-  * Hubic
+  * Amazon S3
   * Backblaze B2
-  * Yandex Disk
-  * OpenDrive
-  * SFTP
+  * Box
+  * Dropbox
   * FTP
+  * Google Cloud Storage
+  * Google Drive
+  * HTTP
+  * Hubic
+  * Microsoft Azure Blob Storage
+  * Microsoft OneDrive
+  * OpenDrive
+  * Openstack Swift / Rackspace cloud files / Memset Memstore
+  * QingStor
+  * SFTP
+  * Yandex Disk
   * The local filesystem
 
 Features
@@ -99,6 +102,8 @@ func init() {
 // ShowVersion prints the version to stdout
 func ShowVersion() {
 	fmt.Printf("rclone %s\n", fs.Version)
+	fmt.Printf("- os/arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("- go version: %s\n", runtime.Version())
 }
 
 // newFsFile creates a dst Fs from a name but may point to a file.
@@ -167,30 +172,6 @@ func NewFsSrcDst(args []string) (fs.Fs, fs.Fs) {
 	return fsrc, fdst
 }
 
-// RemoteSplit splits a remote into a parent and a leaf
-//
-// if it returns leaf as an empty string then remote is a directory
-//
-// if it returns parent as an empty string then that means the current directory
-//
-// The returned values have the property that parent + leaf == remote
-func RemoteSplit(remote string) (parent string, leaf string) {
-	// Split remote on :
-	i := strings.Index(remote, ":")
-	remoteName := ""
-	remotePath := remote
-	if i >= 0 {
-		remoteName = remote[:i+1]
-		remotePath = remote[i+1:]
-	} else if strings.HasSuffix(remotePath, "/") {
-		// if no : and ends with / must be directory
-		return remotePath, ""
-	}
-	// Construct new remote name without last segment
-	parent, leaf = path.Split(remotePath)
-	return remoteName + parent, leaf
-}
-
 // NewFsSrcDstFiles creates a new src and dst fs from the arguments
 // If src is a file then srcFileName and dstFileName will be non-empty
 func NewFsSrcDstFiles(args []string) (fsrc fs.Fs, srcFileName string, fdst fs.Fs, dstFileName string) {
@@ -198,7 +179,7 @@ func NewFsSrcDstFiles(args []string) (fsrc fs.Fs, srcFileName string, fdst fs.Fs
 	// If copying a file...
 	dstRemote := args[1]
 	if srcFileName != "" {
-		dstRemote, dstFileName = RemoteSplit(dstRemote)
+		dstRemote, dstFileName = fs.RemoteSplit(dstRemote)
 		if dstRemote == "" {
 			dstRemote = "."
 		}
@@ -225,6 +206,20 @@ func NewFsDst(args []string) fs.Fs {
 	fdst := newFsDst(args[0])
 	fs.CalculateModifyWindow(fdst)
 	return fdst
+}
+
+// NewFsDstFile creates a new dst fs with a destination file name from the arguments
+func NewFsDstFile(args []string) (fdst fs.Fs, dstFileName string) {
+	dstRemote, dstFileName := fs.RemoteSplit(args[0])
+	if dstRemote == "" {
+		dstRemote = "."
+	}
+	if dstFileName == "" {
+		log.Fatalf("%q is a directory", args[0])
+	}
+	fdst = newFsDst(dstRemote)
+	fs.CalculateModifyWindow(fdst)
+	return
 }
 
 // ShowStats returns true if the user added a `--stats` flag to the command line.
@@ -278,7 +273,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 		log.Fatalf("Failed to %s: %v", cmd.Name(), err)
 	}
 	if showStats && (fs.Stats.Errored() || *statsInterval > 0) {
-		fs.Infof(nil, "%s", fs.Stats)
+		fs.Stats.Log()
 	}
 	fs.Debugf(nil, "Go routines at exit %d\n", runtime.NumGoroutine())
 	if fs.Stats.Errored() {

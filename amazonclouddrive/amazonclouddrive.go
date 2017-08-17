@@ -3,7 +3,6 @@
 package amazonclouddrive
 
 /*
-
 FIXME make searching for directory in id and file in id more efficient
 - use the name: search parameter - remember the escaping rules
 - use Folder GetNode and GetFile
@@ -34,15 +33,13 @@ import (
 )
 
 const (
-	rcloneClientID              = "amzn1.application-oa2-client.6bf18d2d1f5b485c94c8988bb03ad0e7"
-	rcloneEncryptedClientSecret = "ZP12wYlGw198FtmqfOxyNAGXU3fwVcQdmt--ba1d00wJnUs0LOzvVyXVDbqhbcUqnr5Vd1QejwWmiv1Ep7UJG1kUQeuBP5n9goXWd5MrAf0"
-	folderKind                  = "FOLDER"
-	fileKind                    = "FILE"
-	assetKind                   = "ASSET"
-	statusAvailable             = "AVAILABLE"
-	timeFormat                  = time.RFC3339 // 2014-03-07T22:31:12.173Z
-	minSleep                    = 20 * time.Millisecond
-	warnFileSize                = 50000 << 20 // Display warning for files larger than this size
+	folderKind      = "FOLDER"
+	fileKind        = "FILE"
+	assetKind       = "ASSET"
+	statusAvailable = "AVAILABLE"
+	timeFormat      = time.RFC3339 // 2014-03-07T22:31:12.173Z
+	minSleep        = 20 * time.Millisecond
+	warnFileSize    = 50000 << 20 // Display warning for files larger than this size
 )
 
 // Globals
@@ -57,8 +54,8 @@ var (
 			AuthURL:  "https://www.amazon.com/ap/oa",
 			TokenURL: "https://api.amazon.com/auth/o2/token",
 		},
-		ClientID:     rcloneClientID,
-		ClientSecret: fs.MustReveal(rcloneEncryptedClientSecret),
+		ClientID:     "",
+		ClientSecret: "",
 		RedirectURL:  oauthutil.RedirectURL,
 	}
 )
@@ -77,10 +74,16 @@ func init() {
 		},
 		Options: []fs.Option{{
 			Name: fs.ConfigClientID,
-			Help: "Amazon Application Client Id - leave blank normally.",
+			Help: "Amazon Application Client Id - required.",
 		}, {
 			Name: fs.ConfigClientSecret,
-			Help: "Amazon Application Client Secret - leave blank normally.",
+			Help: "Amazon Application Client Secret - required.",
+		}, {
+			Name: fs.ConfigAuthURL,
+			Help: "Auth server URL - leave blank to use Amazon's.",
+		}, {
+			Name: fs.ConfigTokenURL,
+			Help: "Token server url - leave blank to use Amazon's.",
 		}},
 	})
 	fs.VarP(&tempLinkThreshold, "acd-templink-threshold", "", "Files >= this size will be downloaded via their tempLink.")
@@ -188,7 +191,17 @@ func NewFs(name, root string) (fs.Fs, error) {
 		pacer:        pacer.New().SetMinSleep(minSleep).SetPacer(pacer.AmazonCloudDrivePacer),
 		noAuthClient: fs.Config.Client(),
 	}
-	f.features = (&fs.Features{CaseInsensitive: true, ReadMimeType: true}).Fill(f)
+	f.features = (&fs.Features{
+		CaseInsensitive:         true,
+		ReadMimeType:            true,
+		CanHaveEmptyDirectories: true,
+	}).Fill(f)
+
+	// Renew the token in the background
+	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
+		_, err := f.getRootInfo()
+		return err
+	})
 
 	// Update endpoints
 	var resp *http.Response
@@ -206,12 +219,6 @@ func NewFs(name, root string) (fs.Fs, error) {
 		return nil, errors.Wrap(err, "failed to get root")
 	}
 	f.trueRootID = *rootInfo.Id
-
-	// Renew the token in the background
-	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
-		_, err := f.getRootInfo()
-		return err
-	})
 
 	f.dirCache = dircache.New(root, f.trueRootID, f)
 
@@ -396,45 +403,54 @@ func (f *Fs) listAll(dirID string, title string, directoriesOnly bool, filesOnly
 	return
 }
 
-// ListDir reads the directory specified by the job into out, returning any more jobs
-func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
-	fs.Debugf(f, "Reading %q", job.Path)
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
+	err = f.dirCache.FindRoot(false)
+	if err != nil {
+		return nil, err
+	}
+	directoryID, err := f.dirCache.FindDir(dir, false)
+	if err != nil {
+		return nil, err
+	}
 	maxTries := fs.Config.LowLevelRetries
+	var iErr error
 	for tries := 1; tries <= maxTries; tries++ {
-		_, err = f.listAll(job.DirID, "", false, false, func(node *acd.Node) bool {
-			remote := job.Path + *node.Name
+		entries = nil
+		_, err = f.listAll(directoryID, "", false, false, func(node *acd.Node) bool {
+			remote := path.Join(dir, *node.Name)
 			switch *node.Kind {
 			case folderKind:
-				if out.IncludeDirectory(remote) {
-					dir := &fs.Dir{
-						Name:  remote,
-						Bytes: -1,
-						Count: -1,
-					}
-					dir.When, _ = time.Parse(timeFormat, *node.ModifiedDate) // FIXME
-					if out.AddDir(dir) {
-						return true
-					}
-					if job.Depth > 0 {
-						jobs = append(jobs, dircache.ListDirJob{DirID: *node.Id, Path: remote + "/", Depth: job.Depth - 1})
-					}
-				}
+				// cache the directory ID for later lookups
+				f.dirCache.Put(remote, *node.Id)
+				when, _ := time.Parse(timeFormat, *node.ModifiedDate) // FIXME
+				d := fs.NewDir(remote, when).SetID(*node.Id)
+				entries = append(entries, d)
 			case fileKind:
 				o, err := f.newObjectWithInfo(remote, node)
 				if err != nil {
-					out.SetError(err)
+					iErr = err
 					return true
 				}
-				if out.Add(o) {
-					return true
-				}
+				entries = append(entries, o)
 			default:
 				// ignore ASSET etc
 			}
 			return false
 		})
+		if iErr != nil {
+			return nil, iErr
+		}
 		if fs.IsRetryError(err) {
-			fs.Debugf(f, "Directory listing error for %q: %v - low level retry %d/%d", job.Path, err, tries, maxTries)
+			fs.Debugf(f, "Directory listing error for %q: %v - low level retry %d/%d", dir, err, tries, maxTries)
 			continue
 		}
 		if err != nil {
@@ -442,13 +458,7 @@ func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.
 		}
 		break
 	}
-	fs.Debugf(f, "Finished reading %q", job.Path)
-	return jobs, err
-}
-
-// List walks the path returning iles and directories into out
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	f.dirCache.List(f, out, dir)
+	return entries, nil
 }
 
 // checkUpload checks to see if an error occurred after the file was
@@ -547,7 +557,7 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 	err := o.readMetaData()
 	switch err {
 	case nil:
-		return o, o.Update(in, src)
+		return o, o.Update(in, src, options...)
 	case fs.ErrorObjectNotFound:
 		// Not found so create it
 	default:

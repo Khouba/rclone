@@ -23,6 +23,7 @@ import (
 
 var (
 	followSymlinks = fs.BoolP("copy-links", "L", false, "Follow symlinks and copy the pointed to item.")
+	skipSymlinks   = fs.BoolP("skip-links", "", false, "Don't warn about skipped symlinks.")
 	noUTFNorm      = fs.BoolP("local-no-unicode-normalization", "", false, "Don't apply unicode normalization to paths and filenames")
 )
 
@@ -66,11 +67,13 @@ type Fs struct {
 
 // Object represents a local filesystem object
 type Object struct {
-	fs     *Fs                    // The Fs this object is part of
-	remote string                 // The remote path - properly UTF-8 encoded - for rclone
-	path   string                 // The local path - may not be properly UTF-8 encoded - for OS
-	info   os.FileInfo            // Interface for file info (always present)
-	hashes map[fs.HashType]string // Hashes
+	fs      *Fs    // The Fs this object is part of
+	remote  string // The remote path - properly UTF-8 encoded - for rclone
+	path    string // The local path - may not be properly UTF-8 encoded - for OS
+	size    int64  // file metadata - always present
+	mode    os.FileMode
+	modTime time.Time
+	hashes  map[fs.HashType]string // Hashes
 }
 
 // ------------------------------------------------------------
@@ -89,7 +92,10 @@ func NewFs(name, root string) (fs.Fs, error) {
 		dirNames: newMapper(),
 	}
 	f.root = f.cleanPath(root)
-	f.features = (&fs.Features{CaseInsensitive: f.caseInsensitive()}).Fill(f)
+	f.features = (&fs.Features{
+		CaseInsensitive:         f.caseInsensitive(),
+		CanHaveEmptyDirectories: true,
+	}).Fill(f)
 	if *followSymlinks {
 		f.lstat = os.Stat
 	}
@@ -159,7 +165,7 @@ func (f *Fs) newObject(remote, dstPath string) *Object {
 func (f *Fs) newObjectWithInfo(remote, dstPath string, info os.FileInfo) (fs.Object, error) {
 	o := f.newObject(remote, dstPath)
 	if info != nil {
-		o.info = info
+		o.setMetadata(info)
 	} else {
 		err := o.lstat()
 		if err != nil {
@@ -169,7 +175,7 @@ func (f *Fs) newObjectWithInfo(remote, dstPath string, info os.FileInfo) (fs.Obj
 			return nil, err
 		}
 	}
-	if o.info.Mode().IsDir() {
+	if o.mode.IsDir() {
 		return nil, errors.Wrapf(fs.ErrorNotAFile, "%q", remote)
 	}
 	return o, nil
@@ -181,26 +187,32 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(remote, "", nil)
 }
 
-// listArgs is the arguments that a new list takes
-type listArgs struct {
-	remote  string
-	dirpath string
-	level   int
-}
-
-// list traverses the directory passed in, listing to out.
-// it returns a boolean whether it is finished or not.
-func (f *Fs) list(out fs.ListOpts, remote string, dirpath string, level int) (subdirs []listArgs) {
-	fd, err := os.Open(dirpath)
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
+	dir = f.dirNames.Load(dir)
+	fsDirPath := f.cleanPath(filepath.Join(f.root, dir))
+	remote := f.cleanRemote(dir)
+	_, err = os.Stat(fsDirPath)
 	if err != nil {
-		out.SetError(errors.Wrapf(err, "failed to open directory %q", dirpath))
-		return nil
+		return nil, fs.ErrorDirNotFound
 	}
 
+	fd, err := os.Open(fsDirPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to open directory %q", dir)
+	}
 	defer func() {
-		err := fd.Close()
-		if err != nil {
-			out.SetError(errors.Wrapf(err, "failed to close directory %q:", dirpath))
+		cerr := fd.Close()
+		if cerr != nil && err == nil {
+			err = errors.Wrapf(cerr, "failed to close directory %q:", dir)
 		}
 	}()
 
@@ -210,106 +222,41 @@ func (f *Fs) list(out fs.ListOpts, remote string, dirpath string, level int) (su
 			break
 		}
 		if err != nil {
-			out.SetError(errors.Wrapf(err, "failed to read directory %q", dirpath))
-
-			return nil
+			return nil, errors.Wrapf(err, "failed to read directory %q", dir)
 		}
 
 		for _, fi := range fis {
 			name := fi.Name()
 			mode := fi.Mode()
 			newRemote := path.Join(remote, name)
-			newPath := filepath.Join(dirpath, name)
+			newPath := filepath.Join(fsDirPath, name)
 			// Follow symlinks if required
 			if *followSymlinks && (mode&os.ModeSymlink) != 0 {
 				fi, err = os.Stat(newPath)
 				if err != nil {
-					out.SetError(err)
-					return nil
+					return nil, err
 				}
 				mode = fi.Mode()
 			}
 			if fi.IsDir() {
 				// Ignore directories which are symlinks.  These are junction points under windows which
 				// are kind of a souped up symlink. Unix doesn't have directories which are symlinks.
-				if (mode&os.ModeSymlink) == 0 && out.IncludeDirectory(newRemote) && f.dev == readDevice(fi) {
-					dir := &fs.Dir{
-						Name:  f.dirNames.Save(newRemote, f.cleanRemote(newRemote)),
-						When:  fi.ModTime(),
-						Bytes: 0,
-						Count: 0,
-					}
-					if out.AddDir(dir) {
-						return nil
-					}
-					if level > 0 {
-						subdirs = append(subdirs, listArgs{remote: newRemote, dirpath: newPath, level: level - 1})
-					}
+				if (mode&os.ModeSymlink) == 0 && f.dev == readDevice(fi) {
+					d := fs.NewDir(f.dirNames.Save(newRemote, f.cleanRemote(newRemote)), fi.ModTime())
+					entries = append(entries, d)
 				}
 			} else {
 				fso, err := f.newObjectWithInfo(newRemote, newPath, fi)
 				if err != nil {
-					out.SetError(err)
-					return nil
+					return nil, err
 				}
-				if fso.Storable() && out.Add(fso) {
-					return nil
+				if fso.Storable() {
+					entries = append(entries, fso)
 				}
 			}
 		}
 	}
-	return subdirs
-}
-
-// List the path into out
-//
-// Ignores everything which isn't Storable, eg links etc
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	defer out.Finished()
-	dir = f.dirNames.Load(dir)
-	root := f.cleanPath(filepath.Join(f.root, dir))
-	dir = f.cleanRemote(dir)
-	_, err := os.Stat(root)
-	if err != nil {
-		out.SetError(fs.ErrorDirNotFound)
-		return
-	}
-
-	in := make(chan listArgs, out.Buffer())
-	var wg sync.WaitGroup         // sync closing of go routines
-	var traversing sync.WaitGroup // running directory traversals
-
-	// Start the process
-	traversing.Add(1)
-	in <- listArgs{remote: dir, dirpath: root, level: out.Level() - 1}
-	for i := 0; i < fs.Config.Checkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range in {
-				if out.IsFinished() {
-					continue
-				}
-				newJobs := f.list(out, job.remote, job.dirpath, job.level)
-				// Now we have traversed this directory, send
-				// these ones off for traversal
-				if len(newJobs) != 0 {
-					traversing.Add(len(newJobs))
-					go func() {
-						for _, newJob := range newJobs {
-							in <- newJob
-						}
-					}()
-				}
-				traversing.Done()
-			}
-		}()
-	}
-
-	// Wait for traversal to finish
-	traversing.Wait()
-	close(in)
-	wg.Wait()
+	return entries, nil
 }
 
 // cleanRemote makes string a valid UTF-8 string for remote strings.
@@ -381,6 +328,11 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 		return nil, err
 	}
 	return o, nil
+}
+
+// PutStream uploads to the remote path with the modTime given of indeterminate size
+func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(in, src, options...)
 }
 
 // Mkdir creates the directory if it doesn't exist
@@ -510,7 +462,7 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 		// OK
 	} else if err != nil {
 		return nil, err
-	} else if !dstObj.info.Mode().IsRegular() {
+	} else if !dstObj.mode.IsRegular() {
 		// It isn't a file
 		return nil, errors.New("can't move file onto non-file")
 	}
@@ -523,8 +475,16 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 
 	// Do the move
 	err = os.Rename(srcObj.path, dstObj.path)
-	if err != nil {
+	if os.IsNotExist(err) {
+		// race condition, source was deleted in the meantime
 		return nil, err
+	} else if os.IsPermission(err) {
+		// not enough rights to write to dst
+		return nil, err
+	} else if err != nil {
+		// not quite clear, but probably trying to move a file across file system
+		// boundaries. Copying might still work.
+		return nil, fs.ErrorCantMove
 	}
 
 	// Update the info
@@ -598,14 +558,14 @@ func (o *Object) Remote() string {
 // Hash returns the requested hash of a file as a lowercase hex string
 func (o *Object) Hash(r fs.HashType) (string, error) {
 	// Check that the underlying file hasn't changed
-	oldtime := o.info.ModTime()
-	oldsize := o.info.Size()
+	oldtime := o.modTime
+	oldsize := o.size
 	err := o.lstat()
 	if err != nil {
 		return "", errors.Wrap(err, "hash: failed to stat")
 	}
 
-	if !o.info.ModTime().Equal(oldtime) || oldsize != o.info.Size() {
+	if !o.modTime.Equal(oldtime) || oldsize != o.size {
 		o.hashes = nil
 	}
 
@@ -629,12 +589,12 @@ func (o *Object) Hash(r fs.HashType) (string, error) {
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
-	return o.info.Size()
+	return o.size
 }
 
 // ModTime returns the modification time of the object
 func (o *Object) ModTime() time.Time {
-	return o.info.ModTime()
+	return o.modTime
 }
 
 // SetModTime sets the modification time of the local fs object
@@ -656,14 +616,16 @@ func (o *Object) Storable() bool {
 			return false
 		}
 	}
-	mode := o.info.Mode()
+	mode := o.mode
 	// On windows a file with os.ModeSymlink represents a file with reparse points
 	if runtime.GOOS == "windows" && (mode&os.ModeSymlink) != 0 {
 		fs.Debugf(o, "Clearing symlink bit to allow a file with reparse points to be copied")
 		mode &^= os.ModeSymlink
 	}
 	if mode&os.ModeSymlink != 0 {
-		fs.Logf(o, "Can't follow symlink without -L/--copy-links")
+		if !*skipSymlinks {
+			fs.Logf(o, "Can't follow symlink without -L/--copy-links")
+		}
 		return false
 	} else if mode&(os.ModeNamedPipe|os.ModeSocket|os.ModeDevice) != 0 {
 		fs.Logf(o, "Can't transfer non file/directory")
@@ -803,10 +765,19 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	return o.lstat()
 }
 
+// setMetadata sets the file info from the os.FileInfo passed in
+func (o *Object) setMetadata(info os.FileInfo) {
+	o.size = info.Size()
+	o.modTime = info.ModTime()
+	o.mode = info.Mode()
+}
+
 // Stat a Object into info
 func (o *Object) lstat() error {
 	info, err := o.fs.lstat(o.path)
-	o.info = info
+	if err == nil {
+		o.setMetadata(info)
+	}
 	return err
 }
 
@@ -938,9 +909,10 @@ func cleanWindowsName(f *Fs, name string) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs       = &Fs{}
-	_ fs.Purger   = &Fs{}
-	_ fs.Mover    = &Fs{}
-	_ fs.DirMover = &Fs{}
-	_ fs.Object   = &Object{}
+	_ fs.Fs          = &Fs{}
+	_ fs.Purger      = &Fs{}
+	_ fs.PutStreamer = &Fs{}
+	_ fs.Mover       = &Fs{}
+	_ fs.DirMover    = &Fs{}
+	_ fs.Object      = &Object{}
 )

@@ -4,13 +4,14 @@ package fs
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 )
 
-var oldSyncMethod = BoolP("old-sync-method", "", false, "Temporary flag to select old sync method")
+var oldSyncMethod = BoolP("old-sync-method", "", false, "Deprecated - use --fast-list instead")
 
 type syncCopyMove struct {
 	// parameters
@@ -30,6 +31,8 @@ type syncCopyMove struct {
 	srcFilesChan   chan Object         // passes src objects
 	srcFilesResult chan error          // error result of src listing
 	dstFilesResult chan error          // error result of dst listing
+	dstEmptyDirsMu sync.Mutex          // protect dstEmptyDirs
+	dstEmptyDirs   []DirEntry          // potentially empty directories
 	abort          chan struct{}       // signal to abort the copiers
 	checkerWg      sync.WaitGroup      // wait for checkers
 	toBeChecked    ObjectPairChan      // checkers channel
@@ -49,6 +52,8 @@ type syncCopyMove struct {
 	renameCheck    []Object            // accumulate files to check for rename here
 	backupDir      Fs                  // place to store overwrites/deletes
 	suffix         string              // suffix to add to files placed in backupDir
+	srcListDir     listDirFn           // function to call to list a directory in the src
+	dstListDir     listDirFn           // function to call to list a directory in the dst
 }
 
 func newSyncCopyMove(fdst, fsrc Fs, deleteMode DeleteMode, DoMove bool) (*syncCopyMove, error) {
@@ -117,7 +122,45 @@ func newSyncCopyMove(fdst, fsrc Fs, deleteMode DeleteMode, DoMove bool) (*syncCo
 		}
 		s.suffix = Config.Suffix
 	}
+	s.srcListDir = s.makeListDir(fsrc, false)
+	s.dstListDir = s.makeListDir(fdst, Config.Filter.DeleteExcluded)
 	return s, nil
+}
+
+// list a directory into entries, err
+type listDirFn func(dir string) (entries DirEntries, err error)
+
+// makeListDir makes a listing function for the given fs and includeAll flags
+func (s *syncCopyMove) makeListDir(f Fs, includeAll bool) listDirFn {
+	if !Config.UseListR || f.Features().ListR == nil {
+		return func(dir string) (entries DirEntries, err error) {
+			return ListDirSorted(f, includeAll, dir)
+		}
+	}
+	var (
+		mu      sync.Mutex
+		started bool
+		dirs    DirTree
+		dirsErr error
+	)
+	return func(dir string) (entries DirEntries, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !started {
+			dirs, dirsErr = NewDirTree(f, s.dir, includeAll, Config.MaxDepth)
+			started = true
+		}
+		if dirsErr != nil {
+			return nil, dirsErr
+		}
+		entries, ok := dirs[dir]
+		if !ok {
+			err = ErrorDirNotFound
+		} else {
+			delete(dirs, dir)
+		}
+		return entries, err
+	}
 }
 
 // Check to see if have set the abort flag
@@ -146,46 +189,6 @@ outer:
 	}
 	close(out)
 	s.srcFilesResult <- nil
-}
-
-// This reads the source files from s.srcFiles into srcFilesChan then
-// closes it
-//
-// It returns the final result of the read into s.srcFilesResult
-func (s *syncCopyMove) readSrcUsingMap() {
-	s.pumpMapToChan(s.srcFiles, s.srcFilesChan)
-	s.srcFilesResult <- nil
-}
-
-// This reads the source files into srcFilesChan then closes it
-//
-// It returns the final result of the read into s.srcFilesResult
-func (s *syncCopyMove) readSrcUsingChan() {
-	err := readFilesFn(s.fsrc, false, s.dir, func(o Object) error {
-		if s.aborting() {
-			return ErrorListAborted
-		}
-		select {
-		case s.srcFilesChan <- o:
-		case <-s.abort:
-			return ErrorListAborted
-		}
-		return nil
-	})
-	close(s.srcFilesChan)
-	if err != nil {
-		err = errors.Wrapf(err, "error listing source: %s", s.fsrc)
-	}
-	s.srcFilesResult <- err
-}
-
-// This reads the destination files in into dstFiles
-//
-// It returns the final result of the read into s.dstFilesResult
-func (s *syncCopyMove) readDstFiles() {
-	var err error
-	s.dstFiles, err = readFilesMap(s.fdst, Config.Filter.DeleteExcluded, s.dir)
-	s.dstFilesResult <- err
 }
 
 // NeedTransfer checks to see if src needs to be copied to dst using
@@ -508,6 +511,46 @@ func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 	return deleteFilesWithBackupDir(toDelete, s.backupDir)
 }
 
+// This deletes the empty directories in the slice passed in.  It
+// ignores any errors deleting directories
+func deleteEmptyDirectories(f Fs, entries DirEntries) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if Stats.Errored() {
+		Errorf(f, "%v", ErrorNotDeletingDirs)
+		return ErrorNotDeletingDirs
+	}
+
+	// Now delete the empty directories starting from the longest path
+	sort.Sort(entries)
+	var errorCount int
+	var okCount int
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		dir, ok := entry.(Directory)
+		if ok {
+			// TryRmdir only deletes empty directories
+			err := TryRmdir(f, dir.Remote())
+			if err != nil {
+				Debugf(logDirName(f, dir.Remote()), "Failed to Rmdir: %v", err)
+				errorCount++
+			} else {
+				okCount++
+			}
+		} else {
+			Errorf(f, "Not a directory: %v", entry)
+		}
+	}
+	if errorCount > 0 {
+		Debugf(f, "failed to delete %d directories", errorCount)
+	}
+	if okCount > 0 {
+		Debugf(f, "deleted %d directories", okCount)
+	}
+	return nil
+}
+
 // renameHash makes a string with the size and the hash for rename detection
 //
 // it may return an empty string in which case no hash could be made
@@ -624,136 +667,6 @@ func (s *syncCopyMove) tryRename(src Object) bool {
 	return true
 }
 
-// Syncs fsrc into fdst
-//
-// If Delete is true then it deletes any files in fdst that aren't in fsrc
-//
-// If DoMove is true then files will be moved instead of copied
-//
-// dir is the start directory, "" for root
-func (s *syncCopyMove) runRecursive() error {
-	if Same(s.fdst, s.fsrc) {
-		Errorf(s.fdst, "Nothing to do as source and destination are the same")
-		return nil
-	}
-
-	err := Mkdir(s.fdst, "")
-	if err != nil {
-		return err
-	}
-
-	// Start reading dstFiles if required
-	if !s.noTraverse {
-		go s.readDstFiles()
-	}
-
-	// If --delete-before then we need to read the whole source map first
-	readSourceMap := s.deleteMode == DeleteModeBefore
-
-	if readSourceMap {
-		// Read source files into the map
-		s.srcFiles, err = readFilesMap(s.fsrc, false, s.dir)
-		if err != nil {
-			return err
-		}
-
-	}
-
-	// Wait for dstfiles to finish reading if we were reading them
-	// and report any errors
-	if !s.noTraverse {
-		err = <-s.dstFilesResult
-		if err != nil {
-			return err
-		}
-	}
-
-	// Delete files first if required
-	if s.deleteMode == DeleteModeBefore {
-		err = s.deleteFiles(true)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Now we can fill the src channel.
-	if readSourceMap {
-		// Pump the map into s.srcFilesChan
-		go s.readSrcUsingMap()
-	} else {
-		go s.readSrcUsingChan()
-	}
-
-	// Start background checking and transferring pipeline
-	s.startCheckers()
-	s.startRenamers()
-	s.startTransfers()
-
-	// Do the transfers
-	s.startTrackRenames()
-	for src := range s.srcFilesChan {
-		remote := src.Remote()
-		var dst Object
-		if s.noTraverse {
-			var err error
-			dst, err = s.fdst.NewObject(remote)
-			if err != nil {
-				dst = nil
-				if err != ErrorObjectNotFound {
-					Debugf(src, "Error making NewObject: %v", err)
-				}
-			}
-		} else {
-			s.dstFilesMu.Lock()
-			var ok bool
-			dst, ok = s.dstFiles[remote]
-			if ok {
-				// Remove file from s.dstFiles because it exists in srcFiles
-				delete(s.dstFiles, remote)
-			}
-			s.dstFilesMu.Unlock()
-		}
-		if dst != nil {
-			s.toBeChecked <- ObjectPair{src, dst}
-		} else if s.trackRenames {
-			// Save object to check for a rename later
-			s.trackRenamesCh <- src
-		} else {
-			// No need to check since doesn't exist
-			s.toBeUploaded <- ObjectPair{src, nil}
-		}
-	}
-
-	s.stopTrackRenames()
-	if s.trackRenames {
-		// Build the map of the remaining dstFiles by hash
-		s.makeRenameMap()
-		// Attempt renames for all the files which don't have a matching dst
-		for _, src := range s.renameCheck {
-			s.toBeRenamed <- ObjectPair{src, nil}
-		}
-	}
-
-	// Stop background checking and transferring pipeline
-	s.stopCheckers()
-	s.stopRenamers()
-	s.stopTransfers()
-
-	// Retrieve the delayed error from the source listing goroutine
-	err = <-s.srcFilesResult
-
-	// Delete files during or after
-	if s.deleteMode == DeleteModeDuring || s.deleteMode == DeleteModeAfter {
-		if err != nil {
-			Errorf(s.fdst, "%v", ErrorNotDeleting)
-		} else {
-			err = s.deleteFiles(false)
-		}
-	}
-	s.processError(err)
-	return s.currentError()
-}
-
 // listDirJob describe a directory listing that needs to be done
 type listDirJob struct {
 	remote   string
@@ -770,7 +683,7 @@ type listDirJob struct {
 // If DoMove is true then files will be moved instead of copied
 //
 // dir is the start directory, "" for root
-func (s *syncCopyMove) runDirAtATime() error {
+func (s *syncCopyMove) run() error {
 	srcDepth := Config.MaxDepth
 	if srcDepth < 0 {
 		srcDepth = MaxLevel
@@ -783,12 +696,6 @@ func (s *syncCopyMove) runDirAtATime() error {
 	if Same(s.fdst, s.fsrc) {
 		Errorf(s.fdst, "Nothing to do as source and destination are the same")
 		return nil
-	}
-
-	// Make the destination directory
-	err := Mkdir(s.fdst, s.dir)
-	if err != nil {
-		return err
 	}
 
 	// Start background checking and transferring pipeline
@@ -816,7 +723,7 @@ func (s *syncCopyMove) runDirAtATime() error {
 					if !ok {
 						return
 					}
-					jobs := s._runDirAtATime(job)
+					jobs := s.processJob(job)
 					if len(jobs) > 0 {
 						traversing.Add(len(jobs))
 						go func() {
@@ -870,11 +777,20 @@ func (s *syncCopyMove) runDirAtATime() error {
 			s.processError(s.deleteFiles(false))
 		}
 	}
+
+	// Prune empty directories
+	if s.deleteMode != DeleteModeOff {
+		if s.currentError() != nil {
+			Errorf(s.fdst, "%v", ErrorNotDeletingDirs)
+		} else {
+			s.processError(deleteEmptyDirectories(s.fdst, s.dstEmptyDirs))
+		}
+	}
 	return s.currentError()
 }
 
 // Have an object which is in the destination only
-func (s *syncCopyMove) dstOnly(dst BasicInfo, job listDirJob, jobs *[]listDirJob) {
+func (s *syncCopyMove) dstOnly(dst DirEntry, job listDirJob, jobs *[]listDirJob) {
 	if s.deleteMode == DeleteModeOff {
 		return
 	}
@@ -891,7 +807,7 @@ func (s *syncCopyMove) dstOnly(dst BasicInfo, job listDirJob, jobs *[]listDirJob
 		default:
 			panic(fmt.Sprintf("unexpected delete mode %d", s.deleteMode))
 		}
-	case *Dir:
+	case Directory:
 		// Do the same thing to the entire contents of the directory
 		if job.dstDepth > 0 {
 			*jobs = append(*jobs, listDirJob{
@@ -900,6 +816,12 @@ func (s *syncCopyMove) dstOnly(dst BasicInfo, job listDirJob, jobs *[]listDirJob
 				noSrc:    true,
 			})
 		}
+		// Record directory as it is potentially empty and needs deleting
+		if s.fdst.Features().CanHaveEmptyDirectories {
+			s.dstEmptyDirsMu.Lock()
+			s.dstEmptyDirs = append(s.dstEmptyDirs, dst)
+			s.dstEmptyDirsMu.Unlock()
+		}
 	default:
 		panic("Bad object in DirEntries")
 
@@ -907,7 +829,7 @@ func (s *syncCopyMove) dstOnly(dst BasicInfo, job listDirJob, jobs *[]listDirJob
 }
 
 // Have an object which is in the source only
-func (s *syncCopyMove) srcOnly(src BasicInfo, job listDirJob, jobs *[]listDirJob) {
+func (s *syncCopyMove) srcOnly(src DirEntry, job listDirJob, jobs *[]listDirJob) {
 	if s.deleteMode == DeleteModeOnly {
 		return
 	}
@@ -920,7 +842,7 @@ func (s *syncCopyMove) srcOnly(src BasicInfo, job listDirJob, jobs *[]listDirJob
 			// No need to check since doesn't exist
 			s.toBeUploaded <- ObjectPair{x, nil}
 		}
-	case *Dir:
+	case Directory:
 		// Do the same thing to the entire contents of the directory
 		if job.srcDepth > 0 {
 			*jobs = append(*jobs, listDirJob{
@@ -935,7 +857,7 @@ func (s *syncCopyMove) srcOnly(src BasicInfo, job listDirJob, jobs *[]listDirJob
 }
 
 // Given a src and a dst, transfer the src to dst
-func (s *syncCopyMove) transfer(dst, src BasicInfo, job listDirJob, jobs *[]listDirJob) {
+func (s *syncCopyMove) transfer(dst, src DirEntry, job listDirJob, jobs *[]listDirJob) {
 	switch srcX := src.(type) {
 	case Object:
 		if s.deleteMode == DeleteModeOnly {
@@ -950,9 +872,9 @@ func (s *syncCopyMove) transfer(dst, src BasicInfo, job listDirJob, jobs *[]list
 			Errorf(dst, "%v", err)
 			s.processError(err)
 		}
-	case *Dir:
+	case Directory:
 		// Do the same thing to the entire contents of the directory
-		_, ok := dst.(*Dir)
+		_, ok := dst.(Directory)
 		if ok {
 			if job.srcDepth > 0 && job.dstDepth > 0 {
 				*jobs = append(*jobs, listDirJob{
@@ -972,8 +894,83 @@ func (s *syncCopyMove) transfer(dst, src BasicInfo, job listDirJob, jobs *[]list
 	}
 }
 
+type matchPair struct {
+	src, dst DirEntry
+}
+
+// Process the two sorted listings, matching up the items in the two
+// sorted slices
+//
+// Into srcOnly go Entries which only exist in the srcList
+// Into dstOnly go Entries which only exist in the dstList
+// Into matches go matchPair's of src and dst which have the same name
+//
+// This checks for duplicates and checks the list is sorted.
+func matchListings(srcList, dstList DirEntries) (srcOnly DirEntries, dstOnly DirEntries, matches []matchPair) {
+	for iSrc, iDst := 0, 0; ; iSrc, iDst = iSrc+1, iDst+1 {
+		var src, dst DirEntry
+		var srcRemote, dstRemote string
+		if iSrc < len(srcList) {
+			src = srcList[iSrc]
+			srcRemote = src.Remote()
+		}
+		if iDst < len(dstList) {
+			dst = dstList[iDst]
+			dstRemote = dst.Remote()
+		}
+		if src == nil && dst == nil {
+			break
+		}
+		if src != nil && iSrc > 0 {
+			prev := srcList[iSrc-1].Remote()
+			if srcRemote == prev {
+				Logf(src, "Duplicate %s found in source - ignoring", DirEntryType(src))
+				src = nil // ignore the src
+			} else if srcRemote < prev {
+				Errorf(src, "Out of order listing in source")
+				src = nil // ignore the src
+			}
+		}
+		if dst != nil && iDst > 0 {
+			prev := dstList[iDst-1].Remote()
+			if dstRemote == prev {
+				Logf(dst, "Duplicate %s found in destination - ignoring", DirEntryType(dst))
+				dst = nil // ignore the dst
+			} else if dstRemote < prev {
+				Errorf(dst, "Out of order listing in destination")
+				dst = nil // ignore the dst
+			}
+		}
+		if src != nil && dst != nil {
+			if srcRemote < dstRemote {
+				dst = nil
+				iDst-- // retry the dst
+			} else if srcRemote > dstRemote {
+				src = nil
+				iSrc-- // retry the src
+			}
+		}
+		// Debugf(nil, "src = %v, dst = %v", src, dst)
+		switch {
+		case src == nil && dst == nil:
+			// do nothing
+		case src == nil:
+			dstOnly = append(dstOnly, dst)
+		case dst == nil:
+			srcOnly = append(srcOnly, src)
+		default:
+			matches = append(matches, matchPair{src: src, dst: dst})
+		}
+	}
+	return
+}
+
+// processJob processes a listDirJob listing the source and
+// destination directories, comparing them and returning a slice of
+// more jobs
+//
 // returns errors using processError
-func (s *syncCopyMove) _runDirAtATime(job listDirJob) (jobs []listDirJob) {
+func (s *syncCopyMove) processJob(job listDirJob) (jobs []listDirJob) {
 	var (
 		srcList, dstList       DirEntries
 		srcListErr, dstListErr error
@@ -985,14 +982,14 @@ func (s *syncCopyMove) _runDirAtATime(job listDirJob) (jobs []listDirJob) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			srcList, srcListErr = ListDirSorted(s.fsrc, false, job.remote)
+			srcList, srcListErr = s.srcListDir(job.remote)
 		}()
 	}
 	if !job.noDst {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dstList, dstListErr = ListDirSorted(s.fdst, Config.Filter.DeleteExcluded, job.remote)
+			dstList, dstListErr = s.dstListDir(job.remote)
 		}()
 	}
 
@@ -1009,39 +1006,25 @@ func (s *syncCopyMove) _runDirAtATime(job listDirJob) (jobs []listDirJob) {
 		return nil
 	}
 
-	// Process the two listings, matching up the items in the two sorted slices
-	for iSrc, iDst := 0, 0; ; iSrc, iDst = iSrc+1, iDst+1 {
+	// Work out what to do and do it
+	srcOnly, dstOnly, matches := matchListings(srcList, dstList)
+	for _, src := range srcOnly {
 		if s.aborting() {
 			return nil
 		}
-		var src, dst BasicInfo
-		if iSrc < len(srcList) {
-			src = srcList[iSrc]
+		s.srcOnly(src, job, &jobs)
+	}
+	for _, dst := range dstOnly {
+		if s.aborting() {
+			return nil
 		}
-		if iDst < len(dstList) {
-			dst = dstList[iDst]
+		s.dstOnly(dst, job, &jobs)
+	}
+	for _, match := range matches {
+		if s.aborting() {
+			return nil
 		}
-		if src == nil && dst == nil {
-			break
-		}
-		if src != nil && dst != nil {
-			if src.Remote() < dst.Remote() {
-				dst = nil
-				iDst-- // retry the dst
-			} else if src.Remote() > dst.Remote() {
-				src = nil
-				iSrc-- // retry the src
-			}
-		}
-		// Debugf(nil, "src = %v, dst = %v", src, dst)
-		switch {
-		case src == nil:
-			s.dstOnly(dst, job, &jobs)
-		case dst == nil:
-			s.srcOnly(src, job, &jobs)
-		default:
-			s.transfer(dst, src, job, &jobs)
-		}
+		s.transfer(match.dst, match.src, job, &jobs)
 	}
 	return jobs
 }
@@ -1054,20 +1037,23 @@ func (s *syncCopyMove) _runDirAtATime(job listDirJob) (jobs []listDirJob) {
 //
 // dir is the start directory, "" for root
 func runSyncCopyMove(fdst, fsrc Fs, deleteMode DeleteMode, DoMove bool) error {
+	if *oldSyncMethod {
+		return FatalError(errors.New("--old-sync-method is deprecated use --fast-list instead"))
+	}
 	if deleteMode != DeleteModeOff && DoMove {
-		return errors.New("can't delete and move at the same time")
+		return FatalError(errors.New("can't delete and move at the same time"))
 	}
 	// Run an extra pass to delete only
-	if !*oldSyncMethod && deleteMode == DeleteModeBefore {
+	if deleteMode == DeleteModeBefore {
 		if Config.TrackRenames {
-			return errors.New("can't use --delete-before with --track-renames")
+			return FatalError(errors.New("can't use --delete-before with --track-renames"))
 		}
 		// only delete stuff during in this pass
 		do, err := newSyncCopyMove(fdst, fsrc, DeleteModeOnly, false)
 		if err != nil {
 			return err
 		}
-		err = do.runDirAtATime()
+		err = do.run()
 		if err != nil {
 			return err
 		}
@@ -1078,10 +1064,7 @@ func runSyncCopyMove(fdst, fsrc Fs, deleteMode DeleteMode, DoMove bool) error {
 	if err != nil {
 		return err
 	}
-	if *oldSyncMethod {
-		return do.runRecursive()
-	}
-	return do.runDirAtATime()
+	return do.run()
 }
 
 // Sync fsrc into fdst

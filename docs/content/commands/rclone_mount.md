@@ -1,5 +1,5 @@
 ---
-date: 2017-03-18T11:19:45Z
+date: 2017-07-22T18:15:25+01:00
 title: "rclone mount"
 slug: rclone_mount
 url: /commands/rclone_mount/
@@ -12,27 +12,31 @@ Mount the remote as a mountpoint. **EXPERIMENTAL**
 
 
 
-rclone mount allows Linux, FreeBSD and macOS to mount any of Rclone's
-cloud storage systems as a file system with FUSE.
+rclone mount allows Linux, FreeBSD, macOS and Windows to
+mount any of Rclone's cloud storage systems as a file system with
+FUSE.
 
 This is **EXPERIMENTAL** - use with care.
 
 First set up your remote using `rclone config`.  Check it works with `rclone ls` etc.
 
-Start the mount like this (note the & on the end to put rclone in the background).
+Start the mount like this
 
-    rclone mount remote:path/to/files /path/to/local/mount &
+    rclone mount remote:path/to/files /path/to/local/mount
 
-Stop the mount with
+Or on Windows like this where X: is an unused drive letter
 
+    rclone mount remote:path/to/files X:
+
+When the program ends, either via Ctrl+C or receiving a SIGINT or SIGTERM signal,
+the mount is automatically stopped.
+
+The umount operation can fail, for example when the mountpoint is busy.
+When that happens, it is the user's responsibility to stop the mount manually with
+
+    # Linux
     fusermount -u /path/to/local/mount
-
-Or if that fails try
-
-    fusermount -z -u /path/to/local/mount
-
-Or with OS X
-
+    # OS X
     umount /path/to/local/mount
 
 ### Limitations ###
@@ -49,7 +53,7 @@ None of these support the concept of directories, so empty
 directories will have a tendency to disappear once they fall out of
 the directory cache.
 
-Only supported on Linux, FreeBSD and OS X at the moment.
+Only supported on Linux, FreeBSD, OS X and Windows at the moment.
 
 ### rclone mount vs rclone sync/copy ##
 
@@ -65,6 +69,21 @@ mount won't do that, so will be less reliable than the rclone command.
 Note that all the rclone filters can be used to select a subset of the
 files to be visible in the mount.
 
+### Directory Cache ###
+
+Using the `--dir-cache-time` flag, you can set how long a
+directory should be considered up to date and not refreshed from the
+backend. Changes made locally in the mount may appear immediately or
+invalidate the cache. However, changes done on the remote will only
+be picked up once the cache expires.
+
+Alternatively, you can send a `SIGHUP` signal to rclone for
+it to flush all directory caches, regardless of how old they are.
+Assuming only one rclone instance is running, you can reset the cache
+like this:
+
+    kill -SIGHUP $(pidof rclone)
+
 ### Bugs ###
 
   * All the remotes should work for read, but some may not for write
@@ -72,15 +91,9 @@ files to be visible in the mount.
     * maybe should pass in size as -1 to mean work it out
     * Or put in an an upload cache to cache the files on disk first
 
-### TODO ###
-
-  * Check hashes on upload/download
-  * Preserve timestamps
-  * Move directories
-
 
 ```
-rclone mount remote:path /path/to/mountpoint
+rclone mount remote:path /path/to/mountpoint [flags]
 ```
 
 ### Options
@@ -92,13 +105,17 @@ rclone mount remote:path /path/to/mountpoint
       --debug-fuse                Debug the FUSE internals - needs -v.
       --default-permissions       Makes kernel enforce access control based on the file mode.
       --dir-cache-time duration   Time to cache directory entries for. (default 5m0s)
+      --fuse-flag stringArray     Flags or arguments to be passed direct to libfuse/WinFsp. Repeat if required.
       --gid uint32                Override the gid field set by the filesystem. (default 502)
       --max-read-ahead int        The number of bytes that can be prefetched for sequential reads. (default 128k)
-      --no-modtime                Don't read the modification time (can speed things up).
+      --no-checksum               Don't compare checksums on up/download.
+      --no-modtime                Don't read/write the modification time (can speed things up).
       --no-seek                   Don't allow seeking in files.
+  -o, --option stringArray        Option for libfuse/WinFsp. Repeat if required.
+      --poll-interval duration    Time to wait between polling for changes. Must be smaller than dir-cache-time. Only on supported remotes. Set to 0 to disable. (default 1m0s)
       --read-only                 Mount read-only.
       --uid uint32                Override the uid field set by the filesystem. (default 502)
-      --umask int                 Override the permission bits set by the filesystem. (default 2)
+      --umask int                 Override the permission bits set by the filesystem.
       --write-back-cache          Makes kernel buffer writes before sending them to rclone. Without this, writethrough caching is used.
 ```
 
@@ -126,12 +143,13 @@ rclone mount remote:path /path/to/mountpoint
       --delete-before                     When synchronizing, delete files on destination before transfering
       --delete-during                     When synchronizing, delete files during transfer (default)
       --delete-excluded                   Delete files on dest excluded from sync
-      --drive-auth-owner-only             Only consider files owned by the authenticated user. Requires drive-full-list.
+      --drive-auth-owner-only             Only consider files owned by the authenticated user.
       --drive-chunk-size int              Upload chunk size. Must a power of 2 >= 256k. (default 8M)
       --drive-formats string              Comma separated list of preferred formats for downloading Google docs. (default "docx,xlsx,pptx,svg")
-      --drive-full-list                   Use a full listing for directory list. More data but usually quicker. (obsolete)
       --drive-list-chunk int              Size of listing chunk 100-1000. 0 to disable. (default 1000)
+      --drive-shared-with-me              Only show files that are shared with me
       --drive-skip-gdocs                  Skip google documents in all listings.
+      --drive-trashed-only                Only show files that are in the trash
       --drive-upload-cutoff int           Cutoff for switching to chunked upload (default 8M)
       --drive-use-trash                   Send files to the trash instead of deleting permanently.
       --dropbox-chunk-size int            Upload chunk size. Max 150M. (default 128M)
@@ -142,17 +160,21 @@ rclone mount remote:path /path/to/mountpoint
       --dump-headers                      Dump HTTP headers - may contain sensitive info
       --exclude stringArray               Exclude files matching pattern
       --exclude-from stringArray          Read exclude patterns from file
+      --fast-list                         Use recursive list if available. Uses more memory but fewer transactions.
       --files-from stringArray            Read list of source-file names from file
   -f, --filter stringArray                Add a file-filtering rule
       --filter-from stringArray           Read filtering patterns from a file
+      --gcs-location string               Default location for buckets (us|eu|asia|us-central1|us-east1|us-east4|us-west1|asia-east1|asia-noetheast1|asia-southeast1|australia-southeast1|europe-west1|europe-west2).
+      --gcs-storage-class string          Default storage class for buckets (MULTI_REGIONAL|REGIONAL|STANDARD|NEARLINE|COLDLINE|DURABLE_REDUCED_AVAILABILITY).
       --ignore-checksum                   Skip post copy check of checksums.
       --ignore-existing                   Skip all files that exist on destination
       --ignore-size                       Ignore size when skipping use mod-time or checksum.
   -I, --ignore-times                      Don't skip files that match size and time - transfer all files
       --include stringArray               Include files matching pattern
       --include-from stringArray          Read include patterns from file
+      --local-no-unicode-normalization    Don't apply unicode normalization to paths and filenames
       --log-file string                   Log everything to this file
-      --log-level string                  Log level DEBUG|INFO|NOTICE|ERROR (default "INFO")
+      --log-level string                  Log level DEBUG|INFO|NOTICE|ERROR (default "NOTICE")
       --low-level-retries int             Number of low level retries to do. (default 10)
       --max-age string                    Don't transfer any file older than this in s or suffix ms|s|m|h|d|w|M|y
       --max-depth int                     If set limits the recursion depth to this. (default -1)
@@ -165,7 +187,7 @@ rclone mount remote:path /path/to/mountpoint
       --no-gzip-encoding                  Don't set Accept-Encoding: gzip.
       --no-traverse                       Don't traverse destination file system on copy.
       --no-update-modtime                 Don't update destination mod-time if files identical.
-      --old-sync-method                   Temporary flag to select old sync method
+      --old-sync-method                   Deprecated - use --fast-list instead
   -x, --one-file-system                   Don't cross filesystem boundaries.
       --onedrive-chunk-size int           Above this size files will be chunked - must be multiple of 320k. (default 10M)
       --onedrive-upload-cutoff int        Cutoff for switching to chunked upload - must be <= 100MB (default 10M)
@@ -175,12 +197,15 @@ rclone mount remote:path /path/to/mountpoint
       --s3-storage-class string           Storage class to use when uploading S3 objects (STANDARD|REDUCED_REDUNDANCY|STANDARD_IA)
       --size-only                         Skip based on size only, not mod-time or checksum
       --stats duration                    Interval between printing stats, e.g 500ms, 60s, 5m. (0 to disable) (default 1m0s)
+      --stats-log-level string            Log level to show --stats output DEBUG|INFO|NOTICE|ERROR (default "INFO")
       --stats-unit string                 Show data rate in stats as either 'bits' or 'bytes'/s (default "bytes")
       --suffix string                     Suffix for use with --backup-dir.
       --swift-chunk-size int              Above this size files will be chunked into a _segments container. (default 5G)
       --syslog                            Use Syslog for logging
       --syslog-facility string            Facility for syslog, eg KERN,USER,... (default "DAEMON")
       --timeout duration                  IO idle timeout (default 5m0s)
+      --tpslimit float                    Limit HTTP transactions per second to this.
+      --tpslimit-burst int                Max burst of transactions for --tpslimit. (default 1)
       --track-renames                     When synchronizing, track file renames and do a server side move if possible
       --transfers int                     Number of file transfers to run in parallel. (default 4)
   -u, --update                            Skip files that are newer on the destination.
@@ -188,6 +213,6 @@ rclone mount remote:path /path/to/mountpoint
 ```
 
 ### SEE ALSO
-* [rclone](/commands/rclone/)	 - Sync files and directories to and from local and remote object stores - v1.36
+* [rclone](/commands/rclone/)	 - Sync files and directories to and from local and remote object stores - v1.37
 
-###### Auto generated by spf13/cobra on 18-Mar-2017
+###### Auto generated by spf13/cobra on 22-Jul-2017
