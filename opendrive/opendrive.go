@@ -704,22 +704,33 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	return "", false, nil
 }
 
-// List walks the path returning files and directories into out
-func (f *Fs) List(out fs.ListOpts, dir string) {
-	f.dirCache.List(f, out, dir)
-}
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
+	fs.Debugf(nil, "List(%v)", dir)
+	err = f.dirCache.FindRoot(false)
+	if err != nil {
+		return nil, err
+	}
+	directoryID, err := f.dirCache.FindDir(dir, false)
+	if err != nil {
+		return nil, err
+	}
 
-// ListDir reads the directory specified by the job into out, returning any more jobs
-func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
-	fs.Debugf(nil, "ListDir(%v)", job.DirID)
-	// get the folderIDs
 	var resp *http.Response
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/folder/list.json/" + f.session.SessionID + "/" + directoryID,
+	}
 	folderList := FolderList{}
 	err = f.pacer.Call(func() (bool, error) {
-		opts := rest.Opts{
-			Method: "GET",
-			Path:   "/folder/list.json/" + f.session.SessionID + "/" + job.DirID,
-		}
 		resp, err = f.srv.CallJSON(&opts, nil, &folderList)
 		return f.shouldRetry(resp, err)
 	})
@@ -730,36 +741,26 @@ func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.
 	for _, folder := range folderList.Folders {
 		folder.Name = restoreReservedChars(folder.Name)
 		fs.Debugf(nil, "Folder: %s (%s)", folder.Name, folder.FolderID)
-		remote := job.Path + folder.Name
-		if out.IncludeDirectory(remote) {
-			dir := &fs.Dir{
-				Name:  remote,
-				Bytes: -1,
-				Count: -1,
-			}
-			dir.When = time.Unix(int64(folder.DateModified), 0)
-			if out.AddDir(dir) {
-				continue
-			}
-			if job.Depth > 0 {
-				jobs = append(jobs, dircache.ListDirJob{DirID: folder.FolderID, Path: remote + "/", Depth: job.Depth - 1})
-			}
-		}
+		remote := path.Join(dir, folder.Name)
+		// cache the directory ID for later lookups
+		f.dirCache.Put(remote, folder.FolderID)
+		d := fs.NewDir(remote, time.Unix(int64(folder.DateModified), 0)).SetID(folder.FolderID)
+		d.SetItems(int64(folder.ChildFolders))
+		entries = append(entries, d)
 	}
 
 	for _, file := range folderList.Files {
 		file.Name = restoreReservedChars(file.Name)
 		fs.Debugf(nil, "File: %s (%s)", file.Name, file.FileID)
-		remote := job.Path + file.Name
+		remote := path.Join(dir, file.Name)
 		o, err := f.newObjectWithInfo(remote, &file)
 		if err != nil {
-			out.SetError(err)
-			continue
+			return nil, err
 		}
-		out.Add(o)
+		entries = append(entries, o)
 	}
 
-	return jobs, nil
+	return entries, nil
 }
 
 // ------------------------------------------------------------
