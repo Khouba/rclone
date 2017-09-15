@@ -1,5 +1,9 @@
 package opendrive
 
+import (
+	"encoding/json"
+)
+
 // Account describes a OpenDRIVE account
 type Account struct {
 	Username string `json:"username"`
@@ -11,20 +15,20 @@ type UserSessionInfo struct {
 	Username string `json:"username"`
 	Password string `json:"passwd"`
 
-	SessionID          string `json:"SessionID"`
-	UserName           string `json:"UserName"`
-	UserFirstName      string `json:"UserFirstName"`
-	UserLastName       string `json:"UserLastName"`
-	AccType            string `json:"AccType"`
-	UserLang           string `json:"UserLang"`
-	UserID             string `json:"UserID"`
-	IsAccountUser      int    `json:"IsAccountUser"`
-	DriveName          string `json:"DriveName"`
-	UserLevel          string `json:"UserLevel"`
-	UserPlan           string `json:"UserPlan"`
-	FVersioning        string `json:"FVersioning"`
-	UserDomain         string `json:"UserDomain"`
-	PartnerUsersDomain string `json:"PartnerUsersDomain"`
+	SessionID          string          `json:"SessionID"`
+	UserName           string          `json:"UserName"`
+	UserFirstName      string          `json:"UserFirstName"`
+	UserLastName       string          `json:"UserLastName"`
+	AccType            string          `json:"AccType"`
+	UserLang           string          `json:"UserLang"`
+	UserID             string          `json:"UserID"`
+	IsAccountUser      json.RawMessage `json:"IsAccountUser"`
+	DriveName          string          `json:"DriveName"`
+	UserLevel          string          `json:"UserLevel"`
+	UserPlan           string          `json:"UserPlan"`
+	FVersioning        string          `json:"FVersioning"`
+	UserDomain         string          `json:"UserDomain"`
+	PartnerUsersDomain string          `json:"PartnerUsersDomain"`
 }
 
 // FolderList describes a OpenDRIVE listing
