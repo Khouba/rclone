@@ -158,7 +158,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create session")
 	}
-
+	resp.Body.Close()
 	fs.Debugf(nil, "Starting OpenDrive session with ID: %s", f.session.SessionID)
 
 	f.features = (&fs.Features{ReadMimeType: true, WriteMimeType: true}).Fill(f)
@@ -240,6 +240,7 @@ func (f *Fs) deleteObject(id string) error {
 		removeDirData := removeFolder{SessionID: f.session.SessionID, FolderID: id}
 		opts := rest.Opts{
 			Method: "POST",
+			NoResponse: true,
 			Path:   "/folder/remove.json",
 		}
 		resp, err := f.srv.CallJSON(&opts, &removeDirData, nil)
@@ -263,7 +264,7 @@ func (f *Fs) purgeCheck(dir string, check bool) error {
 	if err != nil {
 		return err
 	}
-	item, _, err := f.readMetaDataForFolderID(rootID)
+	item, err := f.readMetaDataForFolderID(rootID)
 	if err != nil {
 		return err
 	}
@@ -326,6 +327,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	fs.Debugf(nil, "...%#v\n...%#v", remote, directoryID)
 
 	// Copy the object
 	var resp *http.Response
@@ -348,6 +350,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	resp.Body.Close()
 
 	size, _ := strconv.ParseInt(response.Size, 10, 64)
 	dstObj.id = response.FileID
@@ -404,6 +407,7 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	resp.Body.Close()
 
 	size, _ := strconv.ParseInt(response.Size, 10, 64)
 	dstObj.id = response.FileID
@@ -489,6 +493,7 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) (err error) {
 		fs.Debugf(src, "DirMove error %v", err)
 		return err
 	}
+	resp.Body.Close()
 
 	srcFs.dirCache.FlushDir(srcRemote)
 	return nil
@@ -560,7 +565,8 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 }
 
 // readMetaDataForPath reads the metadata from the path
-func (f *Fs) readMetaDataForFolderID(id string) (info *FolderList, resp *http.Response, err error) {
+func (f *Fs) readMetaDataForFolderID(id string) (info *FolderList, err error) {
+	var resp *http.Response
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/folder/list.json/" + f.session.SessionID + "/" + id,
@@ -569,7 +575,14 @@ func (f *Fs) readMetaDataForFolderID(id string) (info *FolderList, resp *http.Re
 		resp, err = f.srv.CallJSON(&opts, nil, &info)
 		return f.shouldRetry(resp, err)
 	})
-	return info, resp, err
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	return info, err
 }
 
 // Put the object into the bucket
@@ -609,6 +622,7 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create file")
 		}
+		resp.Body.Close()
 
 		o.id = response.FileID
 	}
@@ -659,10 +673,10 @@ func (f *Fs) CreateDir(pathID, leaf string) (newID string, err error) {
 		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
-		// fmt.Printf("...Error %v\n", err)
 		return "", err
 	}
-	// fmt.Printf("...Id %q\n", response.FolderID)
+	resp.Body.Close()
+
 	return response.FolderID, nil
 }
 
@@ -690,6 +704,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	if err != nil {
 		return "", false, errors.Wrap(err, "failed to get folder list")
 	}
+	resp.Body.Close()
 
 	for _, folder := range folderList.Folders {
 		folder.Name = restoreReservedChars(folder.Name)
@@ -737,6 +752,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get folder list")
 	}
+	resp.Body.Close()
 
 	for _, folder := range folderList.Folders {
 		folder.Name = restoreReservedChars(folder.Name)
@@ -810,6 +826,7 @@ func (o *Object) SetModTime(modTime time.Time) error {
 	fs.Debugf(nil, "SetModTime(%v)", modTime.String())
 	opts := rest.Opts{
 		Method: "PUT",
+		NoResponse: true,
 		Path: "/file/filesettings.json",
 	}
 	update := modTimeFile{SessionID: o.fs.session.SessionID, FileID: o.id, FileModificationTime: strconv.FormatInt(modTime.Unix(), 10)}
@@ -841,6 +858,7 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "GET",
+			NoResponse: true,
 			Path:   "/download/file.json/" + o.id + "?session_id=" + o.fs.session.SessionID + "&offset=" + offset,
 		}
 		resp, err = o.fs.srv.Call(&opts)
@@ -859,6 +877,7 @@ func (o *Object) Remove() error {
 	return o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "DELETE",
+			NoResponse: true,
 			Path:   "/file.json/" + o.fs.session.SessionID + "/" + o.id,
 		}
 		resp, err := o.fs.srv.Call(&opts)
@@ -979,7 +998,6 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		if err != nil {
 			return errors.Wrap(err, "failed to create file")
 		}
-
 		resp.Body.Close()
 
 		chunkCounter++
@@ -1001,6 +1019,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if err != nil {
 		return errors.Wrap(err, "failed to create file")
 	}
+	resp.Body.Close()
 	fs.Debugf(nil, "PostClose: %#v", closeResponse)
 
 	o.id = closeResponse.FileID
@@ -1018,6 +1037,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		fs.Debugf(nil, "Permissions : %#v", update)
 		opts := rest.Opts{
 			Method: "POST",
+			NoResponse: true,
 			Path:   "/file/access.json",
 		}
 		resp, err = o.fs.srv.CallJSON(&opts, &update, nil)
@@ -1051,6 +1071,7 @@ func (o *Object) readMetaData() (err error) {
 	if err != nil {
 		return errors.Wrap(err, "failed to get folder list")
 	}
+	resp.Body.Close()
 
 	if len(folderList.Files) == 0 {
 		return fs.ErrorObjectNotFound
