@@ -858,7 +858,6 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "GET",
-			NoResponse: true,
 			Path:   "/download/file.json/" + o.id + "?session_id=" + o.fs.session.SessionID + "&offset=" + offset,
 		}
 		resp, err = o.fs.srv.Call(&opts)
