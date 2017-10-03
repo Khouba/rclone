@@ -97,6 +97,7 @@ type removeFolder struct {
 // File describes a OpenDRIVE file
 type File struct {
 	FileID            string `json:"FileId"`
+	FileHash          string `json:"FileHash"`
 	Name              string `json:"Name"`
 	GroupID           int    `json:"GroupID"`
 	Extension         string `json:"Extension"`

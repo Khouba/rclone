@@ -522,6 +522,7 @@ func (f *Fs) newObjectWithInfo(remote string, file *File) (fs.Object, error) {
 			id:      file.FileID,
 			modTime: time.Unix(file.DateModified, 0),
 			size:    file.Size,
+			md5:     file.FileHash,
 		}
 	} else {
 		o = &Object{
@@ -1079,7 +1080,7 @@ func (o *Object) readMetaData() (err error) {
 	leafFile := folderList.Files[0]
 	o.id = leafFile.FileID
 	o.modTime = time.Unix(leafFile.DateModified, 0)
-	o.md5 = ""
+	o.md5 = leafFile.FileHash
 	o.size = leafFile.Size
 
 	return nil
