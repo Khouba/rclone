@@ -85,11 +85,11 @@ func (qss *QingStorSigner) BuildSignature(request *http.Request) (string, error)
 	signature := strings.TrimSpace(base64.StdEncoding.EncodeToString(h.Sum(nil)))
 	authorization := "QS " + qss.AccessKeyID + ":" + signature
 
-	logger.Debug(fmt.Sprintf(
+	logger.Debugf(fmt.Sprintf(
 		"QingStor authorization: [%d] %s",
 		convert.StringToUnixTimestamp(request.Header.Get("Date"), convert.RFC822),
-		authorization),
-	)
+		authorization,
+	))
 
 	return authorization, nil
 }
@@ -111,7 +111,7 @@ func (qss *QingStorSigner) BuildQuerySignature(request *http.Request, expires in
 		qss.AccessKeyID, expires, signature,
 	)
 
-	logger.Debug(fmt.Sprintf(
+	logger.Debugf(fmt.Sprintf(
 		"QingStor query signature: [%d] %s",
 		convert.StringToUnixTimestamp(request.Header.Get("Date"), convert.RFC822),
 		query,
@@ -122,12 +122,16 @@ func (qss *QingStorSigner) BuildQuerySignature(request *http.Request, expires in
 
 // BuildStringToSign build the string to sign.
 func (qss *QingStorSigner) BuildStringToSign(request *http.Request) (string, error) {
+	date := request.Header.Get("Date")
+	if request.Header.Get("X-QS-Date") != "" {
+		date = ""
+	}
 	stringToSign := fmt.Sprintf(
 		"%s\n%s\n%s\n%s\n",
 		request.Method,
 		request.Header.Get("Content-MD5"),
 		request.Header.Get("Content-Type"),
-		request.Header.Get("Date"),
+		date,
 	)
 
 	stringToSign += qss.buildCanonicalizedHeaders(request)
@@ -137,7 +141,7 @@ func (qss *QingStorSigner) BuildStringToSign(request *http.Request) (string, err
 	}
 	stringToSign += canonicalizedResource
 
-	logger.Debug(fmt.Sprintf(
+	logger.Debugf(fmt.Sprintf(
 		"QingStor string to sign: [%d] %s",
 		convert.StringToUnixTimestamp(request.Header.Get("Date"), convert.RFC822),
 		stringToSign,
@@ -163,7 +167,7 @@ func (qss *QingStorSigner) BuildQueryStringToSign(request *http.Request, expires
 	}
 	stringToSign += canonicalizedResource
 
-	logger.Debug(fmt.Sprintf(
+	logger.Debugf(fmt.Sprintf(
 		"QingStor query string to sign: [%d] %s",
 		convert.StringToUnixTimestamp(request.Header.Get("Date"), convert.RFC822),
 		stringToSign,
@@ -204,7 +208,7 @@ func (qss *QingStorSigner) buildCanonicalizedResource(request *http.Request) (st
 	parts := []string{}
 	for _, key := range keys {
 		values := query[key]
-		if qss.paramsToSign(key) {
+		if qss.queryToSign(key) {
 			if len(values) > 0 {
 				if values[0] != "" {
 					value := strings.TrimSpace(strings.Join(values, ""))
@@ -227,7 +231,7 @@ func (qss *QingStorSigner) buildCanonicalizedResource(request *http.Request) (st
 		path = path + "?" + joinedParts
 	}
 
-	logger.Debug(fmt.Sprintf(
+	logger.Debugf(fmt.Sprintf(
 		"QingStor canonicalized resource: [%d] %s",
 		convert.StringToUnixTimestamp(request.Header.Get("Date"), convert.RFC822),
 		path,
@@ -236,7 +240,7 @@ func (qss *QingStorSigner) buildCanonicalizedResource(request *http.Request) (st
 	return path, nil
 }
 
-func (qss *QingStorSigner) paramsToSign(key string) bool {
+func (qss *QingStorSigner) queryToSign(key string) bool {
 	keysMap := map[string]bool{
 		"acl":                          true,
 		"cors":                         true,
@@ -247,6 +251,9 @@ func (qss *QingStorSigner) paramsToSign(key string) bool {
 		"stats":                        true,
 		"upload_id":                    true,
 		"uploads":                      true,
+		"image":                        true,
+		"lifecycle":                    true,
+		"logging":                      true,
 		"response-expires":             true,
 		"response-cache-control":       true,
 		"response-content-type":        true,

@@ -217,7 +217,7 @@ func winPath(s string) string {
 func dirsToNames(dirs []fs.Directory) []string {
 	names := []string{}
 	for _, dir := range dirs {
-		names = append(names, winPath(dir.Remote()))
+		names = append(names, winPath(fstest.Normalize(dir.Remote())))
 	}
 	sort.Strings(names)
 	return names
@@ -227,7 +227,7 @@ func dirsToNames(dirs []fs.Directory) []string {
 func objsToNames(objs []fs.Object) []string {
 	names := []string{}
 	for _, obj := range objs {
-		names = append(names, winPath(obj.Remote()))
+		names = append(names, winPath(fstest.Normalize(obj.Remote())))
 	}
 	sort.Strings(names)
 	return names
@@ -877,9 +877,12 @@ func TestObjectRemove(t *testing.T) {
 	fstest.CheckListing(t, remote, []fstest.Item{file2})
 }
 
-// TestFsPutUnknownLengthFile tests uploading files when size is not known in advance
-func TestFsPutUnknownLengthFile(t *testing.T) {
+// TestFsPutStream tests uploading files when size is not known in advance
+func TestFsPutStream(t *testing.T) {
 	skipIfNotOk(t)
+	if remote.Features().PutStream == nil {
+		t.Skip("FS has no PutStream interface")
+	}
 
 	file := fstest.Item{
 		ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
@@ -898,7 +901,7 @@ again:
 
 	file.Size = -1
 	obji := fs.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
-	obj, err := remote.Put(in, obji)
+	obj, err := remote.Features().PutStream(in, obji)
 	if err != nil {
 		// Retry if err returned a retry error
 		if fs.IsRetryError(err) && tries < maxTries {
@@ -908,7 +911,7 @@ again:
 			tries++
 			goto again
 		}
-		require.NoError(t, err, fmt.Sprintf("Put Unknown Length error: %v", err))
+		require.NoError(t, err, fmt.Sprintf("PutStream Unknown Length error: %v", err))
 	}
 	file.Hashes = hash.Sums()
 	file.Size = int64(contentSize) // use correct size when checking

@@ -62,9 +62,11 @@ Choose a number from below, or type in your own value
    \ "yandex"
 Storage> 8
 Google Application Client Id - leave blank normally.
-client_id> 
+client_id>
 Google Application Client Secret - leave blank normally.
-client_secret> 
+client_secret>
+Service Account Credentials JSON file path - needed only if you want use SA instead of interactive login.
+service_account_file>
 Remote config
 Use auto config?
  * Say Y if not sure
@@ -82,8 +84,8 @@ n) No
 y/n> n
 --------------------
 [remote]
-client_id = 
-client_secret = 
+client_id =
+client_secret =
 token = {"AccessToken":"xxxx.x.xxxxx_xxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","RefreshToken":"1/xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxx","Expiry":"2014-03-16T13:57:58.955387075Z","Extra":null}
 --------------------
 y) Yes this is OK
@@ -113,6 +115,25 @@ To copy a local directory to a drive directory called backup
 
     rclone copy /home/source remote:backup
 
+### Service Account support ###
+
+You can set up rclone with Google Drive in an unattended mode,
+i.e. not tied to a specific end-user Google account. This is useful
+when you want to synchronise files onto machines that don't have
+actively logged-in users, for example build machines.
+
+To create a service account and obtain its credentials, go to the
+[Google Developer Console](https://console.developers.google.com) and
+use the "Create Credentials" button. After creating an account, a JSON
+file containing the Service Account's credentials will be downloaded
+onto your machine. These credentials are what rclone will use for
+authentication.
+
+To use a Service Account instead of OAuth2 token flow, enter the path
+to your Service Account credentials at the `service_account_file`
+prompt and rclone won't use the browser based authentication
+flow.
+
 ### Team drives ###
 
 If you want to configure the remote to point to a Google Team Drive
@@ -140,8 +161,8 @@ Choose a number from below, or type in your own value
 Enter a Team Drive ID> 1
 --------------------
 [remote]
-client_id = 
-client_secret = 
+client_id =
+client_secret =
 token = {"AccessToken":"xxxx.x.xxxxx_xxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","RefreshToken":"1/xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxx","Expiry":"2014-03-16T13:57:58.955387075Z","Extra":null}
 team_drive = xxxxxxxxxxxxxxxxxxxx
 --------------------
@@ -169,9 +190,16 @@ was
 
 ### Deleting files ###
 
-By default rclone will delete files permanently when requested.  If
-sending them to the trash is required instead then use the
-`--drive-use-trash` flag.
+By default rclone will send all files to the trash when deleting
+files.  If deleting them permanently is required then use the
+`--drive-use-trash=false` flag, or set the equivalent environment
+variable.
+
+### Emptying trash ###
+
+If you wish to empty your trash you can use the `rclone cleanup remote:`
+command which will permanently delete all your trashed files. This command
+does not take any path arguments.
 
 ### Specific options ###
 
@@ -190,10 +218,6 @@ Making this larger will improve performance, but note that each chunk
 is buffered in memory one per transfer.
 
 Reducing this will reduce memory usage but decrease performance.
-
-#### --drive-auth-owner-only ####
-
-Only consider files owned by the authenticated user.
 
 #### --drive-formats ####
 
@@ -265,8 +289,9 @@ File size cutoff for switching to chunked upload.  Default is 8 MB.
 
 #### --drive-use-trash ####
 
-Send files to the trash instead of deleting permanently. Defaults to
-off, namely deleting files permanently.
+Controls whether files are sent to the trash or deleted
+permanently. Defaults to true, namely sending files to the trash.  Use
+`--drive-use-trash=false` to delete files permanently instead.
 
 ### Limitations ###
 
@@ -336,10 +361,10 @@ be the same account as the Google Drive you want to access)
 
 2. Select a project or create a new project.
 
-3. Under Overview, Google APIs, Google Apps APIs, click "Drive API",
-then "Enable".
+3. Under "ENABLE APIS AND SERVICES" search for "Drive", and enable the
+then "Google Drive API".
 
-4. Click "Credentials" in the left-side panel (not "Go to
+4. Click "Credentials" in the left-side panel (not "Create
 credentials", which opens the wizard), then "Create credentials", then
 "OAuth client ID".  It will prompt you to set the OAuth consent screen
 product name, if you haven't set one already.

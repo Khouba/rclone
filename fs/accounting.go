@@ -18,25 +18,26 @@ import (
 
 // Globals
 var (
-	Stats           = NewStats()
-	tokenBucketMu   sync.Mutex // protects the token bucket variables
-	tokenBucket     *rate.Limiter
-	prevTokenBucket = tokenBucket
-	currLimitMu     sync.Mutex // protects changes to the timeslot
-	currLimit       BwTimeSlot
+	Stats             = NewStats()
+	tokenBucketMu     sync.Mutex // protects the token bucket variables
+	tokenBucket       *rate.Limiter
+	prevTokenBucket   = tokenBucket
+	bwLimitToggledOff = false
+	currLimitMu       sync.Mutex // protects changes to the timeslot
+	currLimit         BwTimeSlot
 )
 
 const maxBurstSize = 1 * 1024 * 1024 // must be bigger than the biggest request
 
 // make a new empty token bucket with the bandwidth given
 func newTokenBucket(bandwidth SizeSuffix) *rate.Limiter {
-	tokenBucket = rate.NewLimiter(rate.Limit(bandwidth), maxBurstSize)
+	newTokenBucket := rate.NewLimiter(rate.Limit(bandwidth), maxBurstSize)
 	// empty the bucket
-	err := tokenBucket.WaitN(context.Background(), maxBurstSize)
+	err := newTokenBucket.WaitN(context.Background(), maxBurstSize)
 	if err != nil {
 		Errorf(nil, "Failed to empty token bucket: %v", err)
 	}
-	return tokenBucket
+	return newTokenBucket
 }
 
 // Start the token bucket if necessary
@@ -72,12 +73,27 @@ func startTokenTicker() {
 			if currLimit.bandwidth != limitNow.bandwidth {
 				tokenBucketMu.Lock()
 
+				// If bwlimit is toggled off, the change should only
+				// become active on the next toggle, which causes
+				// an exchange of tokenBucket <-> prevTokenBucket
+				var targetBucket **rate.Limiter
+				if bwLimitToggledOff {
+					targetBucket = &prevTokenBucket
+				} else {
+					targetBucket = &tokenBucket
+				}
+
 				// Set new bandwidth. If unlimited, set tokenbucket to nil.
 				if limitNow.bandwidth > 0 {
-					tokenBucket = newTokenBucket(limitNow.bandwidth)
-					Logf(nil, "Scheduled bandwidth change. Limit set to %vBytes/s", &limitNow.bandwidth)
+					*targetBucket = newTokenBucket(limitNow.bandwidth)
+					if bwLimitToggledOff {
+						Logf(nil, "Scheduled bandwidth change. "+
+							"Limit will be set to %vBytes/s when toggled on again.", &limitNow.bandwidth)
+					} else {
+						Logf(nil, "Scheduled bandwidth change. Limit set to %vBytes/s", &limitNow.bandwidth)
+					}
 				} else {
-					tokenBucket = nil
+					*targetBucket = nil
 					Logf(nil, "Scheduled bandwidth change. Bandwidth limits disabled")
 				}
 
@@ -153,6 +169,7 @@ type StatsInfo struct {
 	lock         sync.RWMutex
 	bytes        int64
 	errors       int64
+	lastError    error
 	checks       int64
 	checking     stringSet
 	transfers    int64
@@ -235,6 +252,13 @@ func (s *StatsInfo) GetErrors() int64 {
 	return s.errors
 }
 
+// GetLastError returns the lastError
+func (s *StatsInfo) GetLastError() error {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.lastError
+}
+
 // ResetCounters sets the counters (bytes, checks, errors, transfers) to 0
 func (s *StatsInfo) ResetCounters() {
 	s.lock.RLock()
@@ -259,11 +283,12 @@ func (s *StatsInfo) Errored() bool {
 	return s.errors != 0
 }
 
-// Error adds a single error into the stats
-func (s *StatsInfo) Error() {
+// Error adds a single error into the stats and assigns lastError
+func (s *StatsInfo) Error(err error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	s.errors++
+	s.lastError = err
 }
 
 // Checking adds a check into the stats
@@ -547,23 +572,28 @@ func (acc *Account) String() string {
 		}
 	}
 	name := []rune(acc.name)
-	if len(name) > 45 {
-		where := len(name) - 42
-		name = append([]rune{'.', '.', '.'}, name[where:]...)
+	if Config.StatsFileNameLength > 0 {
+		if len(name) > Config.StatsFileNameLength {
+			where := len(name) - Config.StatsFileNameLength
+			name = append([]rune{'.', '.', '.'}, name[where:]...)
+		}
 	}
 
 	if Config.DataRateUnit == "bits" {
 		cur = cur * 8
 	}
 
-	done := ""
+	percentageDone := 0
 	if b > 0 {
-		done = fmt.Sprintf("%2d%% done, ", int(100*float64(a)/float64(b)))
+		percentageDone = int(100 * float64(a) / float64(b))
 	}
-	return fmt.Sprintf("%45s: %s%s, ETA: %s",
+
+	done := fmt.Sprintf("%2d%% /%s", percentageDone, SizeSuffix(b))
+
+	return fmt.Sprintf("%45s: %s, %s/s, %s",
 		string(name),
 		done,
-		SizeSuffix(cur).Unit(strings.Title(Config.DataRateUnit)+"/s"),
+		SizeSuffix(cur),
 		etas,
 	)
 }

@@ -19,6 +19,19 @@ See below for some expanded Linux / macOS instructions.
 See the [Usage section](/docs/) of the docs for how to use rclone, or
 run `rclone -h`.
 
+## Script installation ##
+
+To install rclone on Linux/MacOs/BSD systems, run:
+
+    curl https://rclone.org/install.sh | sudo bash
+
+For beta installation, run:
+
+    curl https://rclone.org/install.sh | sudo bash -s beta
+
+Note that this script checks the version of rclone installed first and
+won't re-download if not needed.
+
 ## Linux installation from precompiled binary ##
 
 Fetch and unpack
@@ -55,7 +68,10 @@ Unzip the download and cd to the extracted folder.
 
 Move rclone to your $PATH. You will be prompted for your password.
 
+    sudo mkdir -p /usr/local/bin
     sudo mv rclone /usr/local/bin/
+
+(the `mkdir` command is safe to run, even if the directory already exists).
 
 Remove the leftover files.
 
@@ -93,57 +109,3 @@ Instructions
       roles:
           - rclone
 ```
-
-## Installation with snap ##
-
-### Quickstart ###
-
-  * install Snapd on your distro using the instructions below
-  * sudo snap install rclone --classic 
-  * Run `rclone config` to setup. See [rclone config docs](/docs/) for more details.
-
-See below for how to install snapd if it isn't already installed
-
-#### Arch ####
-
-    sudo pacman -S snapd
-
-enable the snapd systemd service:
-
-    sudo systemctl enable --now snapd.socket
-
-#### Debian / Ubuntu ####
-
-    sudo apt install snapd
-
-#### Fedora ####
-
-    sudo dnf copr enable zyga/snapcore
-    sudo dnf install snapd
-
-enable the snapd systemd service:
-
-    sudo systemctl enable --now snapd.service
-
-SELinux support is in beta, so currently:
-
-    sudo setenforce 0
-
-to persist, edit `/etc/selinux/config` to set `SELINUX=permissive` and reboot.
-
-#### Gentoo ####
-
-Install the [gentoo-snappy overlay](https://github.com/zyga/gentoo-snappy).
-
-#### OpenEmbedded/Yocto ####
-
-Install the [snap meta layer](https://github.com/morphis/meta-snappy/blob/master/README.md).
-
-#### openSUSE ####
-
-    sudo zypper addrepo https://download.opensuse.org/repositories/system:/snappy/openSUSE_Leap_42.2/ snappy
-    sudo zypper install snapd
-
-#### OpenWrt ####
-
-Enable the snap-openwrt feed.

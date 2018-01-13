@@ -4,7 +4,7 @@ LAST_TAG := $(shell git describe --tags --abbrev=0)
 NEW_TAG := $(shell echo $(LAST_TAG) | perl -lpe 's/v//; $$_ += 0.01; $$_ = sprintf("v%.2f", $$_)')
 GO_VERSION := $(shell go version)
 GO_FILES := $(shell go list ./... | grep -v /vendor/ )
-GO_LATEST := $(findstring go1.8,$(GO_VERSION))
+GO_LATEST := $(findstring go1.9,$(GO_VERSION))
 BETA_URL := https://beta.rclone.org/$(TAG)/
 # Pass in GOTAGS=xyz on the make command line to set build tags
 ifdef GOTAGS
@@ -32,8 +32,9 @@ version:
 
 # Full suite of integration tests
 test:	rclone
-	go test $(BUILDTAGS) $(GO_FILES)
-	cd fs && go run $(BUILDTAGS) test_all.go
+	-go test $(BUILDTAGS) $(GO_FILES) 2>&1 | tee test.log
+	-cd fs && go run $(BUILDTAGS) test_all.go 2>&1 | tee test_all.log
+	@echo "Written logs in test.log and fs/test_all.log"
 
 # Quick test
 quicktest:
@@ -45,10 +46,10 @@ endif
 # Do source code quality checks
 check:	rclone
 ifdef GO_LATEST
-	go tool vet $(BUILDTAGS) -printfuncs Debugf,Infof,Logf,Errorf . 2>&1 | grep -E -v vendor/ ; test $$? -eq 1
-	errcheck $(BUILDTAGS) $(GO_FILES)
+	go vet $(BUILDTAGS) -printfuncs Debugf,Infof,Logf,Errorf ./...
+	errcheck $(BUILDTAGS) ./...
 	find . -name \*.go | grep -v /vendor/ | xargs goimports -d | grep . ; test $$? -eq 1
-	go list ./... | grep -v /vendor/ | xargs -i golint {} | grep -E -v '(StorageUrl|CdnUrl)' ; test $$? -eq 1
+	go list ./... | xargs -n1 golint | grep -E -v '(StorageUrl|CdnUrl)' ; test $$? -eq 1
 else
 	@echo Skipping tests as not on Go stable
 endif
@@ -93,7 +94,7 @@ clean:
 	go clean ./...
 	find . -name \*~ | xargs -r rm -f
 	rm -rf build docs/public
-	rm -f rclone rclonetest/rclonetest
+	rm -f rclone fs/fs.test fs/test_all.log test.log
 
 website:
 	cd docs && hugo
@@ -120,7 +121,7 @@ log_since_last_release:
 
 upload_beta:
 	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ memstore:beta-rclone-org/$(TAG)
-	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' build/ memstore:beta-rclone-org
+	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ memstore:beta-rclone-org
 	@echo Beta release ready at $(BETA_URL)
 
 compile_all:
@@ -134,7 +135,7 @@ travis_beta:
 	git log $(LAST_TAG).. > /tmp/git-log.txt
 	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt -exclude "^windows/" -parallel 8 $(BUILDTAGS) $(TAG)β
 	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ memstore:beta-rclone-org/$(TAG)
-	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' build/ memstore:beta-rclone-org
+	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ memstore:beta-rclone-org
 	@echo Beta release ready at $(BETA_URL)
 
 # Fetch the windows builds from appveyor
@@ -151,7 +152,7 @@ tag:	doc
 	@echo "Old tag is $(LAST_TAG)"
 	@echo "New tag is $(NEW_TAG)"
 	echo -e "package fs\n\n// Version of rclone\nvar Version = \"$(NEW_TAG)\"\n" | gofmt > fs/version.go
-	perl -lpe 's/VERSION/${NEW_TAG}/g; s/DATE/'`date -I`'/g;' docs/content/downloads.md.in > docs/content/downloads.md
+	echo -n "$(NEW_TAG)" > docs/layouts/shortcodes/version.html
 	git tag $(NEW_TAG)
 	@echo "Edit the new changelog in docs/content/changelog.md"
 	@echo "  * $(NEW_TAG) -" `date -I` >> docs/content/changelog.md

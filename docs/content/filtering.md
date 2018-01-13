@@ -69,7 +69,7 @@ docs](https://golang.org/pkg/regexp/syntax/) for more info on these.
              - doesn't match "hullo"
 
 A `{` and `}` define a choice between elements.  It should contain a
-comma seperated list of patterns, any of which might match.  These
+comma separated list of patterns, any of which might match.  These
 patterns can contain wildcards.
 
     {one,two}_potato - matches "one_potato"
@@ -166,6 +166,9 @@ type.
   * `--exclude-from`
   * `--filter`
   * `--filter-from`
+
+**Important** You should not use `--include*` together with `--exclude*`. 
+It may produce different results than you expected. In that case try to use: `--filter*`.
 
 Note that all the options of the same type are processed together in
 the order above, regardless of what order they were placed on the
@@ -265,11 +268,13 @@ processed in.
 
 Prepare a file like this `filter-file.txt`
 
-    # a sample exclude rule file
+    # a sample filter rule file
     - secret*.jpg
     + *.jpg
     + *.png
     + file2.avi
+    - /dir/Trash/**
+    + /dir/**
     # exclude everything else
     - *
 
@@ -277,8 +282,10 @@ Then use as `--filter-from filter-file.txt`.  The rules are processed
 in the order that they are defined.
 
 This example will include all `jpg` and `png` files, exclude any files
-matching `secret*.jpg` and include `file2.avi`.  Everything else will
-be excluded from the sync.
+matching `secret*.jpg` and include `file2.avi`.  It will also include
+everything in the directory `dir` at the root of the sync, except
+`dir/Trash` which it will exclude.  Everything else will be excluded
+from the sync.
 
 ### `--files-from` - Read list of source-file names ###
 
@@ -396,7 +403,7 @@ these are now excluded from the sync.
 
 Always test first with `--dry-run` and `-v` before using this flag.
 
-### `--dump-filters` - dump the filters to the output ###
+### `--dump filters` - dump the filters to the output ###
 
 This dumps the defined filters to the output as regular expressions.
 
@@ -417,3 +424,24 @@ In Windows the expansion is done by the command not the shell so this
 should work fine
 
   * `--include *.jpg`
+
+## Exclude directory based on a file ##
+
+It is possible to exclude a directory based on a file, which is
+present in this directory. Filename should be specified using the
+`--exclude-if-present` flag. This flag has a priority over the other
+filtering flags.
+
+Imagine, you have the following directory structure:
+
+    dir1/file1
+    dir1/dir2/file2
+    dir1/dir2/dir3/file3
+    dir1/dir2/dir3/.ignore
+
+You can exclude `dir3` from sync by running the following command:
+
+    rclone sync --exclude-if-present .ignore dir1 remote:backup
+
+Currently only one filename is supported, i.e. `--exclude-if-present`
+should not be used multiple times.

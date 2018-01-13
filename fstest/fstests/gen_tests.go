@@ -63,10 +63,10 @@ package {{ .FsName }}_test
 import (
 	"testing"
 
+	"github.com/ncw/rclone/backend/{{ .FsName }}"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fstest/fstests"
-	"github.com/ncw/rclone/{{ .FsName }}"
-{{ if eq .FsName "crypt" }}	_ "github.com/ncw/rclone/local"
+{{ if (or (eq .FsName "crypt") (eq .FsName "cache")) }}	_ "github.com/ncw/rclone/backend/local"
 {{end}})
 
 func TestSetup{{ .Suffix }}(t *testing.T)() {
@@ -106,7 +106,7 @@ func generateTestProgram(t *template.Template, fns []string, Fsname string, opti
 	}
 
 	data.TestName = "Test" + data.UpperFsName + data.Suffix + ":"
-	outfile := "../../" + data.FsName + "/" + data.FsName + data.Suffix + "_test.go"
+	outfile := "../../backend/" + data.FsName + "/" + data.FsName + data.Suffix + "_test.go"
 
 	if data.FsName == "local" {
 		data.TestName = ""
@@ -166,5 +166,8 @@ func main() {
 	generateTestProgram(t, fns, "QingStor", buildConstraint("!plan9"))
 	generateTestProgram(t, fns, "AzureBlob", buildConstraint("go1.7"))
 	generateTestProgram(t, fns, "OpenDrive")
+	generateTestProgram(t, fns, "Pcloud")
+	generateTestProgram(t, fns, "Webdav")
+	generateTestProgram(t, fns, "Cache", buildConstraint("!plan9,go1.7"))
 	log.Printf("Done")
 }
