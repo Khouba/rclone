@@ -13,10 +13,10 @@ import (
 
 	"fmt"
 
-	"github.com/ncw/rclone/dircache"
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/pacer"
-	"github.com/ncw/rclone/rest"
+	"github.com/ncw/rclone/lib/dircache"
+	"github.com/ncw/rclone/lib/pacer"
+	"github.com/ncw/rclone/lib/rest"
 	"github.com/pkg/errors"
 )
 
@@ -557,6 +557,7 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 	if err != nil {
 		return nil, leaf, directoryID, err
 	}
+	fs.Debugf(nil, "\n...leaf %#v\n...id %#v", leaf, directoryID)
 	// Temporary Object under construction
 	o = &Object{
 		fs:     f,
@@ -914,6 +915,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	if err != nil {
 		return errors.Wrap(err, "failed to create file")
 	}
+	// resp.Body.Close()
 	fs.Debugf(nil, "PostOpen: %#v", openResponse)
 
 	// 1 MB chunks size
